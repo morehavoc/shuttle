@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shuttle</title>
+<meta name="theme-color" content="#121117">
+<meta name="robots" content="noindex">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span class="brand-mark"></span>Shuttle</a>
+  <div class="topbar-actions" id="top-actions" hidden>
+    <button class="btn btn-ghost" id="signout" type="button">Sign out</button>
+  </div>
+</header>
+
+<section class="signin" id="signin" hidden>
+  <form id="signin-form">
+    <h1>Sign in</h1>
+    <input class="field" id="password" type="password" autocomplete="current-password" placeholder="Password" required autofocus>
+    <p class="error" id="signin-error"></p>
+    <button class="btn btn-primary btn-lg" type="submit">Continue</button>
+  </form>
+</section>
+
+<main class="wrap" id="library" hidden>
+  <div class="hero">
+    <h1>Videos</h1>
+    <button class="btn btn-rec btn-lg" id="new-recording" type="button">
+      <svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>
+      New recording
+    </button>
+  </div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" hidden>
+    <h2>No videos yet</h2>
+    <p>Record your screen and camera, then send the link.</p>
+    <button class="btn btn-primary btn-lg" id="empty-record" type="button">New recording</button>
+  </div>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script src="/app.js" type="module"></script>
+</body>
+</html>

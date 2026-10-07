@@ -1,0 +1,109 @@
+# Deploys Shuttle to Cloudflare (Worker + R2 bucket + D1 database). This is the only deploy path;
+# nobody runs `wrangler deploy` by hand.
+#
+# Repo secrets (Settings → Secrets and variables → Actions):
+#   CLOUDFLARE_API_TOKEN   account token with: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit
+#   CLOUDFLARE_ACCOUNT_ID
+#   OWNER_PASSWORD         the password you sign in with
+# SESSION_SECRET is generated on the first deploy and never leaves Cloudflare.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-shuttle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Generate the test fixture
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          mkdir -p test/out
+          ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 -t 20 \
+            -c:v libx264 -b:v 3M -pix_fmt yuv420p -c:a aac -movflags frag_keyframe+empty_moov test/out/sample.mp4
+      - name: API tests (wrangler dev, local R2 + D1)
+        run: npm test
+
+      - name: Secrets present
+        id: check
+        env:
+          T: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          A: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          P: ${{ secrets.OWNER_PASSWORD }}
+        run: |
+          if [ -z "$T" ] || [ -z "$A" ] || [ -z "$P" ]; then
+            echo "::notice::Not deployed: set CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID and OWNER_PASSWORD on this repo."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Create-or-find only. Nothing in this workflow deletes data.
+      - name: Ensure R2 bucket and D1 database
+        if: steps.check.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler r2 bucket info shuttle-videos >/dev/null 2>&1 || npx wrangler r2 bucket create shuttle-videos
+          ID=$(npx wrangler d1 list --json | jq -r '.[] | select(.name=="shuttle") | .uuid')
+          if [ -z "$ID" ]; then
+            npx wrangler d1 create shuttle
+            ID=$(npx wrangler d1 list --json | jq -r '.[] | select(.name=="shuttle") | .uuid')
+          fi
+          test -n "$ID"
+          sed -i "s/^database_id = .*/database_id = \"$ID\"/" wrangler.toml
+          npx wrangler d1 migrations apply shuttle --remote
+
+      - name: Deploy Worker
+        if: steps.check.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler deploy | tee deploy.log
+          grep -Eo 'https://[a-z0-9.-]+\.workers\.dev' deploy.log | head -1 > url.txt || true
+
+      - name: Worker secrets
+        if: steps.check.outputs.ready == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          OWNER_PASSWORD: ${{ secrets.OWNER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$OWNER_PASSWORD" | npx wrangler secret put OWNER_PASSWORD
+          if ! npx wrangler secret list | grep -q '"SESSION_SECRET"'; then
+            openssl rand -base64 48 | tr -d '\n' | npx wrangler secret put SESSION_SECRET
+          fi
+
+      - name: Verify
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          URL=$(cat url.txt)
+          if [ -z "$URL" ]; then echo "No workers.dev URL in the deploy output (custom domain only?) — skipping"; exit 0; fi
+          for _ in $(seq 1 30); do
+            if curl -fsS "$URL/api/me" | grep -q '"passwordSet":true'; then echo "live at $URL"; exit 0; fi
+            sleep 4
+          done
+          echo "::error::$URL/api/me did not answer with passwordSet:true"; exit 1
