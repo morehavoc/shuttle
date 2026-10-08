@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "wrangler d1 migrations apply shuttle --local && wrangler dev",
-    "migrate:local": "wrangler d1 migrations apply shuttle --local",
-    "test": "node test/api.test.mjs",
+    "dev": "wrangler d1 migrations apply shuttle --local --env local && wrangler dev --env local",
+    "migrate:local": "wrangler d1 migrations apply shuttle --local --env local",
+    "test": "node test/timeline.test.mjs && node test/transcribe.test.mjs && node test/api.test.mjs",
     "test:e2e": "node test/e2e.mjs"
   },
   "devDependencies": {

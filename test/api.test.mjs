@@ -1,8 +1,10 @@
-// API contract test. Starts `wrangler dev` (local R2 + D1), drives the whole lifecycle,
-// stops it. Usage: npm test   (or BASE=http://127.0.0.1:8799 node test/api.test.mjs against a running one)
+// API contract test. Starts `wrangler dev --env local` (local R2 + D1, fake transcription),
+// drives the whole lifecycle, stops it. Usage: npm test
+// (or BASE=http://127.0.0.1:8799 node test/api.test.mjs against one already running with
+//  OWNER_PASSWORD=test-password-123 and TRANSCRIBE_FAKE=1).
 
 import { spawn, execFileSync } from 'node:child_process';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -13,10 +15,21 @@ const BASE = process.env.BASE || `http://127.0.0.1:${PORT}`;
 const PASSWORD = 'test-password-123';
 let server;
 
+// Never let a local run pick up Cloudflare credentials from the environment.
+export function cleanEnv() {
+  const env = { ...process.env };
+  for (const k of ['CF_API_TOKEN', 'CF_ACCOUNT_ID', 'CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CF_KV_NAMESPACE_ID']) delete env[k];
+  return env;
+}
+
 async function startServer() {
   if (process.env.BASE) return;
-  execFileSync('npx', ['wrangler', 'd1', 'migrations', 'apply', 'shuttle', '--local', '--persist-to', '.wrangler/test-state'], { cwd: root, stdio: 'ignore' });
-  server = spawn('npx', ['wrangler', 'dev', '--port', String(PORT), '--ip', '127.0.0.1', '--persist-to', '.wrangler/test-state', '--var', `OWNER_PASSWORD:${PASSWORD}`, '--show-interactive-dev-session=false'], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  // Fresh state every run (the login-throttle test leaves failures behind for 15 minutes).
+  rmSync(path.join(root, '.wrangler/test-state'), { recursive: true, force: true });
+  execFileSync('npx', ['wrangler', 'd1', 'migrations', 'apply', 'shuttle', '--local', '--env', 'local', '--persist-to', '.wrangler/test-state'], { cwd: root, stdio: 'ignore', env: cleanEnv() });
+  server = spawn('npx', ['wrangler', 'dev', '--env', 'local', '--port', String(PORT), '--ip', '127.0.0.1', '--persist-to', '.wrangler/test-state',
+    '--var', `OWNER_PASSWORD:${PASSWORD}`, '--var', 'TRANSCRIBE_FAKE:1', '--show-interactive-dev-session=false'],
+  { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: cleanEnv() });
   let log = '';
   server.stdout.on('data', (d) => { log += d; });
   server.stderr.on('data', (d) => { log += d; });
@@ -34,8 +47,19 @@ async function call(p, opts = {}) {
   if (cookie && !opts.anon) headers.Cookie = cookie;
   let body = opts.body;
   if (body && !(body instanceof Uint8Array) && !(body instanceof ArrayBuffer) && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
-  const r = await fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' });
-  return r;
+  return fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' });
+}
+const j = async (r) => { const t = await r.text(); try { return JSON.parse(t); } catch { throw new Error(`not JSON (${r.status}): ${t.slice(0, 200)}`); } };
+
+// 16 kHz mono 16-bit WAV of `seconds`, a tone so it isn't silent.
+function wav(seconds) {
+  const n = Math.round(16000 * seconds);
+  const buf = Buffer.alloc(44 + n * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(16000, 24);
+  buf.writeUInt32LE(32000, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  for (let i = 0; i < n; i++) buf.writeInt16LE(Math.round(Math.sin(i / 8) * 8000), 44 + i * 2);
+  return new Uint8Array(buf);
 }
 
 const results = [];
@@ -47,12 +71,13 @@ async function test(name, fn) {
 try {
   await startServer();
   const sample = readFileSync(path.join(root, 'test/out/sample.mp4'));
-  const me0 = await (await call('/api/me')).json();
+  const me0 = await j(await call('/api/me'));
   const PART = me0.partSize;
-  let id, share;
+  let id;
 
   await test('anonymous is not owner, owner APIs refuse', async () => {
     assert.equal(me0.owner, false);
+    assert.equal(me0.transcripts, true);
     assert.equal((await call('/api/videos')).status, 401);
     assert.equal((await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } })).status, 401);
   });
@@ -69,7 +94,7 @@ try {
     assert.match(sc, /shuttle_session=\d+\.[\w-]+/);
     assert.match(sc, /HttpOnly/);
     cookie = sc.split(';')[0];
-    assert.equal((await (await call('/api/me')).json()).owner, true);
+    assert.equal((await j(await call('/api/me'))).owner, true);
   });
 
   await test('forged cookie is refused', async () => {
@@ -83,85 +108,126 @@ try {
   });
 
   await test('bad mime refused', async () => {
-    const r = await call('/api/videos', { method: 'POST', body: { mime: 'text/html' } });
-    assert.equal(r.status, 400);
+    assert.equal((await call('/api/videos', { method: 'POST', body: { mime: 'text/html' } })).status, 400);
+    assert.equal((await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', camMime: 'text/html' } })).status, 400);
   });
 
-  await test('create video', async () => {
-    const r = await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4;codecs=avc1,mp4a.40.2', mode: 'screen-camera', tz: 'America/New_York' } });
+  await test('create a screen + camera video (two tracks)', async () => {
+    const r = await call('/api/videos', { method: 'POST', body: {
+      mime: 'video/mp4;codecs=avc1,mp4a.40.2', camMime: 'video/mp4', mode: 'screen-camera', tz: 'America/New_York',
+      surface: 'window', layout: { kind: 'card', corner: 'br', size: 'l' },
+    } });
     assert.equal(r.status, 201);
-    const j = await r.json();
-    id = j.id; share = j.shareUrl;
+    const v = await j(r);
+    id = v.id;
     assert.match(id, /^[A-Za-z0-9]{12}$/);
-    assert.equal(j.partSize, PART);
-    assert.match(j.title, /^Recording · /);
+    assert.equal(v.partSize, PART);
+    assert.equal(v.hasCam, true);
+    assert.match(v.title, /^Recording · /);
   });
 
-  await test('share page while recording shows pending, no og:video', async () => {
+  await test('share page while recording shows pending', async () => {
     const html = await (await call(`/v/${id}`, { anon: true })).text();
     assert.match(html, /Finishing upload/);
-    assert.doesNotMatch(html, /og:video/);
-    const s = await (await call(`/api/videos/${id}/status`, { anon: true })).json();
-    assert.equal(s.status, 'recording');
-  });
-
-  await test('raw is 404 until ready', async () => {
+    assert.equal((await j(await call(`/api/videos/${id}/status`, { anon: true }))).status, 'recording');
     assert.equal((await call(`/raw/${id}`, { anon: true })).status, 404);
   });
 
-  await test('oversize part refused', async () => {
-    const r = await call(`/api/videos/${id}/parts/1`, { method: 'PUT', body: new Uint8Array(PART + 1) });
-    assert.equal(r.status, 400);
+  await test('oversize part and bad track refused', async () => {
+    assert.equal((await call(`/api/videos/${id}/parts/1`, { method: 'PUT', body: new Uint8Array(PART + 1) })).status, 400);
+    assert.equal((await call(`/api/videos/${id}/parts/1?track=evil`, { method: 'PUT', body: new Uint8Array(10) })).status, 400);
   });
 
-  await test('upload parts (fixed size + remainder)', async () => {
+  await test('upload main parts (fixed size + remainder) and a camera part', async () => {
     let n = 0;
     for (let off = 0; off < sample.length; off += PART) {
       n++;
       const r = await call(`/api/videos/${id}/parts/${n}`, { method: 'PUT', body: new Uint8Array(sample.subarray(off, off + PART)) });
-      const txt = await r.text();
-      assert.equal(r.status, 200, txt);
-      const j = JSON.parse(txt);
-      assert.equal(j.partNumber, n);
-      assert.ok(j.etag);
+      const body = await j(r);
+      assert.equal(r.status, 200, JSON.stringify(body));
+      assert.equal(body.partNumber, n);
+      assert.equal(body.track, 'main');
     }
     assert.equal(n, 2);
+    const r = await call(`/api/videos/${id}/parts/1?track=cam`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 300000)) });
+    assert.equal(r.status, 200);
+    assert.equal((await j(r)).track, 'cam');
   });
 
-  await test('thumbnail upload', async () => {
+  await test('audio chunks: transcribed in the background; silence skipped', async () => {
+    let r = await call(`/api/videos/${id}/audio/0`, { method: 'PUT', body: wav(6), headers: { 'X-Start-Ms': '0', 'X-Duration-Ms': '6000' } });
+    assert.equal(r.status, 200);
+    assert.equal((await j(r)).status, 'pending');
+    r = await call(`/api/videos/${id}/audio/1`, { method: 'PUT', body: new Uint8Array(0), headers: { 'X-Start-Ms': '6000', 'X-Duration-Ms': '4000', 'X-Silent': '1' } });
+    assert.equal((await j(r)).status, 'ready');
+    r = await call(`/api/videos/${id}/audio/2`, { method: 'PUT', body: wav(4), headers: { 'X-Start-Ms': '10000', 'X-Duration-Ms': '4000' } });
+    assert.equal(r.status, 200);
+    let t;
+    for (let i = 0; i < 40; i++) {
+      t = await j(await call(`/api/videos/${id}/transcript`));
+      if (t.status !== 'pending') break;
+      await new Promise((res) => setTimeout(res, 250));
+    }
+    assert.equal(t.status, 'ready');
+    assert.ok(t.words.length > 5, `words: ${t.words.length}`);
+    assert.ok(t.words.some((w) => w.s >= 10), 'second chunk offset by its start');
+    assert.ok(t.words.every((w, i) => i === 0 || w.s >= t.words[i - 1].s), 'sorted');
+    assert.ok(t.words.every((w) => !(w.s >= 6 && w.s < 10)), 'nothing in the silent chunk');
+  });
+
+  await test('audio chunk validation', async () => {
+    assert.equal((await call(`/api/videos/${id}/audio/9`, { method: 'PUT', body: new Uint8Array(10), headers: { 'X-Start-Ms': '0' } })).status, 400);
+    assert.equal((await call(`/api/videos/${id}/audio/9`, { method: 'PUT', anon: true, body: wav(1) })).status, 401);
+  });
+
+  await test('thumbnails: poster, camera and link-preview variants', async () => {
     const jpg = execFileSync('ffmpeg', ['-loglevel', 'error', '-i', path.join(root, 'test/out/sample.mp4'), '-frames:v', '1', '-f', 'mjpeg', '-'], { maxBuffer: 1e7 });
-    const r = await call(`/api/videos/${id}/thumb`, { method: 'PUT', body: new Uint8Array(jpg) });
-    assert.equal(r.status, 200);
-    const t = await call(`/thumb/${id}.jpg`, { anon: true });
-    assert.equal(t.headers.get('content-type'), 'image/jpeg');
+    for (const variant of ['poster', 'cam']) {
+      const r = await call(`/api/videos/${id}/thumb?variant=${variant}`, { method: 'PUT', body: new Uint8Array(jpg) });
+      assert.equal(r.status, 200);
+    }
+    assert.equal((await call(`/api/videos/${id}/thumb?variant=evil`, { method: 'PUT', body: new Uint8Array(jpg) })).status, 400);
+    assert.equal((await call(`/thumb/${id}.jpg`, { anon: true })).headers.get('content-type'), 'image/jpeg');
+    assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).headers.get('content-type'), 'image/jpeg');
+    // og falls back to the poster until it exists
+    assert.equal((await call(`/thumb/${id}/og.jpg`, { anon: true })).headers.get('content-type'), 'image/jpeg');
   });
 
-  await test('complete', async () => {
-    const r = await call(`/api/videos/${id}/complete`, { method: 'POST', body: { durationMs: 20000, width: 1280, height: 720, mime: 'video/mp4' } });
-    assert.equal(r.status, 200, await r.clone().text());
-    const j = await r.json();
-    assert.equal(j.status, 'ready');
-    assert.equal(j.size, sample.length);
-    assert.equal(j.durationMs, 20000);
+  await test('complete closes both tracks', async () => {
+    const r = await call(`/api/videos/${id}/complete`, { method: 'POST', body: {
+      durationMs: 20000, width: 1280, height: 720, mime: 'video/mp4', camMime: 'video/mp4', camOffsetMs: 42, camMutedMs: 0, surface: 'window',
+      audioChunks: 3, tapGapMs: 0,
+    } });
+    const v = await j(r);
+    assert.equal(r.status, 200, JSON.stringify(v));
+    assert.equal(v.status, 'ready');
+    assert.equal(v.size, sample.length);
+    assert.equal(v.camSize, 300000);
+    assert.equal(v.hasCam, true);
+    assert.equal(v.camOffsetMs, 42);
+    assert.equal(v.durationMs, 20000);
+    assert.deepEqual(v.layout, { kind: 'card', corner: 'br', size: 'l' });
+    assert.equal(v.surface, 'window');
   });
 
-  await test('complete is idempotent', async () => {
-    const r = await call(`/api/videos/${id}/complete`, { method: 'POST', body: {} });
-    assert.equal(r.status, 200);
+  await test('transcript stays complete when every chunk the recorder made arrived', async () => {
+    assert.equal((await j(await call(`/api/videos/${id}/transcript`))).status, 'ready');
   });
 
-  await test('part upload after complete refused', async () => {
-    const r = await call(`/api/videos/${id}/parts/3`, { method: 'PUT', body: new Uint8Array(10) });
-    assert.equal(r.status, 409);
+  await test('complete is idempotent; parts after complete refused', async () => {
+    assert.equal((await call(`/api/videos/${id}/complete`, { method: 'POST', body: {} })).status, 200);
+    assert.equal((await call(`/api/videos/${id}/parts/3`, { method: 'PUT', body: new Uint8Array(10) })).status, 409);
   });
 
-  await test('raw: full body is byte-identical', async () => {
-    const r = await call(`/raw/${id}`, { anon: true });
+  await test('raw: main is byte-identical, camera served separately', async () => {
+    let r = await call(`/raw/${id}`, { anon: true });
     assert.equal(r.status, 200);
     assert.equal(r.headers.get('accept-ranges'), 'bytes');
     assert.equal(r.headers.get('content-type'), 'video/mp4');
-    const b = Buffer.from(await r.arrayBuffer());
-    assert.ok(b.equals(sample));
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(sample));
+    r = await call(`/raw/${id}/cam`, { anon: true });
+    assert.equal(r.status, 200);
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(sample.subarray(0, 300000)));
   });
 
   await test('raw: range requests', async () => {
@@ -174,93 +240,171 @@ try {
     assert.ok(Buffer.from(await r.arrayBuffer()).equals(sample.subarray(PART - 10)));
     r = await call(`/raw/${id}`, { anon: true, headers: { Range: 'bytes=-500' } });
     assert.ok(Buffer.from(await r.arrayBuffer()).equals(sample.subarray(sample.length - 500)));
-    r = await call(`/raw/${id}`, { anon: true, headers: { Range: `bytes=${sample.length}-` } });
-    assert.equal(r.status, 416);
+    r = await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=10-19' } });
+    assert.equal(r.status, 206);
+    assert.equal(r.headers.get('content-range'), 'bytes 10-19/300000');
+    assert.equal((await call(`/raw/${id}`, { anon: true, headers: { Range: `bytes=${sample.length}-` } })).status, 416);
   });
 
-  await test('raw: download sets a filename', async () => {
-    const r = await call(`/raw/${id}?download=1`, { anon: true, method: 'HEAD' });
+  await test('downloads are the owner’s only', async () => {
+    assert.equal((await call(`/raw/${id}?download=1`, { anon: true })).status, 403);
+    assert.equal((await call(`/raw/${id}/cam?download=1`, { anon: true })).status, 403);
+    assert.equal((await call(`/raw/${id}?DOWNLOAD`, { anon: true })).status, 403);
+    assert.equal((await call(`/raw/${id}/cam?Download=1`, { anon: true })).status, 403);
+    let r = await call(`/raw/${id}?download=1`, { method: 'HEAD' });
+    assert.equal(r.status, 200);
     assert.match(r.headers.get('content-disposition') || '', /attachment; filename=".+\.mp4"/);
+    r = await call(`/raw/${id}/cam?download=1`, { method: 'HEAD' });
+    assert.match(r.headers.get('content-disposition') || '', /\(camera\)\.mp4"/);
   });
 
-  await test('share page: OG tags, escaped title', async () => {
+  await test('layout: valid saved, invalid refused', async () => {
+    let r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'side', corner: 'tr', size: 's' } } });
+    assert.deepEqual((await j(r)).layout, { kind: 'side', corner: 'tr', size: 's' });
+    r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'evil' } } });
+    assert.equal(r.status, 400);
+    r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'bubble', corner: 'nowhere' } } });
+    assert.deepEqual((await j(r)).layout, { kind: 'bubble', corner: 'bl', size: 'm' });
+  });
+
+  await test('Screen layout: viewers get no camera file, camera thumbnail or face in the preview', async () => {
+    await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'screen', corner: 'bl', size: 'm' } } });
+    assert.equal((await call(`/raw/${id}/cam`, { anon: true })).status, 404);
+    assert.equal((await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=0-9' } })).status, 404);
+    assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).status, 404);
+    assert.equal((await call(`/raw/${id}/cam`)).status, 200, 'owner still can');
+    const og = Buffer.from(await (await call(`/thumb/${id}/og.jpg`, { anon: true })).arrayBuffer());
+    const poster = Buffer.from(await (await call(`/thumb/${id}.jpg`, { anon: true })).arrayBuffer());
+    assert.ok(og.equals(poster), 'link preview is the plain poster');
+    const html = await (await call(`/v/${id}`, { anon: true })).text();
+    assert.match(html, /"hasCam":false/);
+    assert.match(html, /og\.jpg\?l=s"/);
+    assert.doesNotMatch(html, /class="avatar" src=/);
+    const page = await (await call(`/v/${id}`)).text();
+    assert.match(page, /"hasCam":true/, 'owner page keeps the camera to switch back');
+    await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'bubble', corner: 'bl', size: 'm' } } });
+    assert.equal((await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=0-9' } })).status, 206);
+  });
+
+  await test('cuts: normalised on save; viewers never get cut words', async () => {
+    const all = await j(await call(`/api/videos/${id}/transcript`));
+    const w = all.words[1];
+    let r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { cuts: [[w.s - 0.05, w.e + 0.05], [1e6, 2e6], [3, 2.99]] } });
+    const v = await j(r);
+    assert.equal(r.status, 200);
+    assert.equal(v.cuts.length, 1);
+    const viewer = await j(await call(`/api/videos/${id}/transcript`, { anon: true }));
+    assert.equal(viewer.words.length, all.words.length - 1);
+    assert.ok(!viewer.words.some((x) => x.s === w.s));
+    const owner = await j(await call(`/api/videos/${id}/transcript`));
+    assert.equal(owner.words.length, all.words.length);
+    assert.equal((await call(`/api/videos/${id}`, { method: 'PATCH', body: { cuts: 'nope' } })).status, 400);
+  });
+
+  await test('share page: link-preview tags, escaped title, owner flag, no owner-only fields for viewers', async () => {
     await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: 'Hello <script>alert(1)</script> & "q"' } });
     const html = await (await call(`/v/${id}`, { anon: true })).text();
-    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\//);
-    assert.match(html, /<meta property="og:video" content=/);
+    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\/[A-Za-z0-9]+\/og\.jpg\?l=c"/);
+    assert.doesNotMatch(html, /og:video/);
     assert.match(html, /Hello &lt;script&gt;alert\(1\)&lt;\/script&gt; &amp; &quot;q&quot;/);
     assert.doesNotMatch(html, /<script>alert/);
     assert.match(html, /"owner":false/);
-  });
-
-  await test('owner sees owner flag on share page', async () => {
-    const html = await (await call(`/v/${id}`)).text();
-    assert.match(html, /"owner":true/);
+    assert.match(html, /Christopher Moravec/);
+    assert.doesNotMatch(html, /"views"|"camMutedMs"|"surface"/);
+    assert.match(await (await call(`/v/${id}`)).text(), /"owner":true/);
   });
 
   await test('empty title refused', async () => {
-    const r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: '   ' } });
-    assert.equal(r.status, 400);
+    assert.equal((await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: '   ' } })).status, 400);
   });
 
   await test('views count viewers, not the owner', async () => {
     await call(`/api/videos/${id}/view`, { method: 'POST', anon: true });
     await call(`/api/videos/${id}/view`, { method: 'POST', anon: true });
     await call(`/api/videos/${id}/view`, { method: 'POST' });
-    const j = await (await call(`/api/videos/${id}`)).json();
-    assert.equal(j.views, 2);
+    assert.equal((await j(await call(`/api/videos/${id}`))).views, 2);
   });
 
   await test('list', async () => {
-    const j = await (await call('/api/videos')).json();
-    assert.ok(j.videos.some((x) => x.id === id && x.status === 'ready'));
+    const v = await j(await call('/api/videos'));
+    assert.ok(v.videos.some((x) => x.id === id && x.status === 'ready' && x.hasCam));
+  });
+
+  await test('a transcript chunk that never arrived reads as a gap, not a finished transcript', async () => {
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
+    await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 1000)) });
+    await call(`/api/videos/${c.id}/audio/0`, { method: 'PUT', body: wav(3), headers: { 'X-Start-Ms': '0', 'X-Duration-Ms': '3000' } });
+    await j(await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { audioChunks: 2, tapGapMs: 4000 } }));
+    let t;
+    for (let i = 0; i < 40; i++) {
+      t = await j(await call(`/api/videos/${c.id}/transcript`));
+      if (t.status !== 'pending') break;
+      await new Promise((res) => setTimeout(res, 250));
+    }
+    assert.equal(t.status, 'partial');
+    assert.equal(t.missing, 1);
+    assert.equal(t.failed, 0);
+    assert.ok(t.words.length > 0);
+    const viewer = await j(await call(`/api/videos/${c.id}/transcript`, { anon: true }));
+    assert.equal(viewer.missing, undefined);
+    assert.equal((await j(await call(`/api/videos/${c.id}`))).tapGapMs, 4000);
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
+  });
+
+  await test('camera track with no data is dropped at complete', async () => {
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', camMime: 'video/mp4', mode: 'screen-camera' } }));
+    assert.equal(c.hasCam, true);
+    await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 1000)) });
+    const v = await j(await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { camMime: 'video/mp4' } }));
+    assert.equal(v.hasCam, false);
+    assert.equal(v.layout.kind, 'bubble'); // stored default, but the player ignores it without a camera
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
   await test('interrupted recording can be recovered from server-side parts', async () => {
-    const c = await (await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } })).json();
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
     await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, PART)) });
     await call(`/api/videos/${c.id}/parts/2`, { method: 'PUT', body: new Uint8Array(sample.subarray(PART, PART + 1000)) });
     const r = await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} });
     assert.equal(r.status, 200);
-    const j = await r.json();
-    assert.equal(j.size, PART + 1000);
+    assert.equal((await j(r)).size, PART + 1000);
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
   await test('complete with no data is refused and keeps the (possibly live) video', async () => {
-    const c = await (await call('/api/videos', { method: 'POST', body: { mime: 'video/webm' } })).json();
-    const r = await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} });
-    assert.equal(r.status, 409);
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/webm' } }));
+    assert.equal((await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} })).status, 409);
     assert.equal((await call(`/api/videos/${c.id}`)).status, 200);
-    const hb = await call(`/api/videos/${c.id}/heartbeat`, { method: 'POST' });
-    assert.equal(hb.status, 200);
+    assert.equal((await call(`/api/videos/${c.id}/heartbeat`, { method: 'POST' })).status, 200);
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
   await test('recover reports a truncated video (gap in parts)', async () => {
-    const c = await (await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } })).json();
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
     await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, PART)) });
     await call(`/api/videos/${c.id}/parts/3`, { method: 'PUT', body: new Uint8Array(sample.subarray(PART, PART + 10)) });
-    const j = await (await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} })).json();
-    assert.equal(j.truncated, true);
-    assert.equal(j.size, PART);
+    const v = await j(await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} }));
+    assert.equal(v.truncated, true);
+    assert.equal(v.size, PART);
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
-  await test('heartbeat and owner routes need the owner', async () => {
-    const r = await call('/api/videos/abcdefabcdef/heartbeat', { method: 'POST', anon: true });
-    assert.equal(r.status, 401);
+  await test('owner-only routes need the owner', async () => {
+    assert.equal((await call('/api/videos/abcdefabcdef/heartbeat', { method: 'POST', anon: true })).status, 401);
+    assert.equal((await call(`/api/videos/${id}/transcript/retry`, { method: 'POST', anon: true })).status, 401);
   });
 
   await test('logout refuses cross-origin', async () => {
-    const r = await call('/api/logout', { method: 'POST', headers: { Origin: 'https://evil.example' } });
-    assert.equal(r.status, 403);
+    assert.equal((await call('/api/logout', { method: 'POST', headers: { Origin: 'https://evil.example' } })).status, 403);
   });
 
-  await test('delete removes the video and its bytes', async () => {
+  await test('delete removes the video, camera, thumbnails and transcript', async () => {
     assert.equal((await call(`/api/videos/${id}`, { method: 'DELETE' })).status, 200);
     assert.equal((await call(`/raw/${id}`, { anon: true })).status, 404);
+    assert.equal((await call(`/raw/${id}/cam`, { anon: true })).status, 404);
     assert.equal((await call(`/v/${id}`, { anon: true })).status, 404);
+    assert.equal((await call(`/api/videos/${id}/transcript`, { anon: true })).status, 404);
+    assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).headers.get('content-type'), 'image/svg+xml');
   });
 
   await test('login is throttled after repeated failures', async () => {
@@ -275,7 +419,7 @@ try {
     const r = await call('/', { anon: true });
     assert.equal(r.status, 200);
     assert.match(await r.text(), /<title>Shuttle<\/title>/);
-    assert.equal((await call('/app.js', { anon: true })).status, 200);
+    for (const f of ['/app.js', '/player.js', '/timeline.js', '/pcm-tap.js']) assert.equal((await call(f, { anon: true })).status, 200, f);
   });
 } finally {
   stopServer();

@@ -3,6 +3,9 @@ main = "src/worker.js"
 compatibility_date = "2026-09-01"
 workers_dev = true
 
+[vars]
+OWNER_NAME = "Christopher Moravec"
+
 [assets]
 directory = "public"
 binding = "ASSETS"
@@ -19,5 +22,28 @@ database_name = "shuttle"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
+# Transcripts (Whisper on Workers AI). Production only: the `local` environment below has
+# no AI binding, so local runs never touch a Cloudflare account.
+[ai]
+binding = "AI"
+
 [observability]
 enabled = true
+
+# Local development, tests and the jaws-mini preview: `wrangler dev --env local`.
+# Same storage, no Workers AI (transcripts there use OPENAI_API_KEY from .dev.vars, or are off).
+[env.local]
+name = "shuttle-local"
+
+[env.local.vars]
+OWNER_NAME = "Christopher Moravec"
+
+[[env.local.r2_buckets]]
+binding = "VIDEOS"
+bucket_name = "shuttle-videos"
+
+[[env.local.d1_databases]]
+binding = "DB"
+database_name = "shuttle"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"

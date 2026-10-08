@@ -1,14 +1,29 @@
 // Shuttle — record a screen/camera video, get a link.
-// One Worker: JSON API (/api/*), the share page (/v/:id), the video bytes (/raw/:id),
-// thumbnails (/thumb/:id). Static app in public/. Videos in R2, metadata in D1.
+// One Worker: JSON API (/api/*), the share page (/v/:id), the video bytes (/raw/:id[/cam]),
+// thumbnails (/thumb/:id[/variant].jpg). Static app in public/. Videos in R2, metadata in D1.
+//
+// A recording has up to two tracks: `main` (screen + all audio, or the camera in camera-only
+// mode) and `cam` (the camera, video only), composited by the player. Edits are cut ranges
+// applied at playback; the files are never rewritten.
 
 import { renderSharePage, renderNotFound } from './share-page.js';
+import { transcribeWav, provider } from './transcribe.js';
+import { normalizeCuts, isWordCut } from '../public/timeline.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
 const SESSION_DAYS = 90;
 const COOKIE = 'shuttle_session';
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ALLOWED_MIME = /^video\/(webm|mp4|x-matroska|quicktime)(;.*)?$/i;
+const ID = '([A-Za-z0-9]{6,32})';
+const TRACKS = ['main', 'cam'];
+const THUMBS = ['poster', 'cam', 'og'];
+const LAYOUT_KINDS = ['bubble', 'card', 'side', 'screen'];
+const CORNERS = ['bl', 'br', 'tl', 'tr'];
+const SIZES = ['s', 'm', 'l'];
+const DEFAULT_LAYOUT = { kind: 'bubble', corner: 'bl', size: 'm' };
+const MAX_AUDIO_CHUNK = 8 * 1024 * 1024;
+const STALE_CHUNK_MS = 2 * 60e3;
 
 export default {
   async fetch(request, env, ctx) {
@@ -31,9 +46,10 @@ async function route(request, env, ctx) {
   const path = url.pathname;
   const method = request.method;
   let m;
+  const match = (re) => (m = path.match(re));
 
   if (path === '/api/me' && method === 'GET') {
-    return json({ owner: await isOwner(request, env), passwordSet: !!env.OWNER_PASSWORD, partSize: PART_SIZE });
+    return json({ owner: await isOwner(request, env), passwordSet: !!env.OWNER_PASSWORD, partSize: PART_SIZE, transcripts: !!provider(env) });
   }
   if (path === '/api/login' && method === 'POST') return login(request, env);
   if (path === '/api/logout' && method === 'POST') {
@@ -42,11 +58,12 @@ async function route(request, env, ctx) {
   }
 
   // Public reads (the id is the capability).
-  if ((m = path.match(/^\/v\/([A-Za-z0-9]{6,32})\/?$/)) && method === 'GET') return sharePage(request, env, m[1]);
-  if ((m = path.match(/^\/raw\/([A-Za-z0-9]{6,32})(?:\.\w+)?$/)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, m[1], url);
-  if ((m = path.match(/^\/thumb\/([A-Za-z0-9]{6,32})(?:\.jpg)?$/)) && method === 'GET') return thumb(env, m[1]);
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/status$/)) && method === 'GET') return status(env, m[1]);
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/view$/)) && method === 'POST') return countView(request, env, m[1]);
+  if (match(new RegExp(`^/v/${ID}/?$`)) && method === 'GET') return sharePage(request, env, m[1]);
+  if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, m[1], m[2] || 'main', url);
+  if (match(new RegExp(`^/thumb/${ID}(?:/(cam|og))?(?:\\.jpg)?$`)) && method === 'GET') return thumb(request, env, m[1], m[2] || 'poster');
+  if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(env, m[1]);
+  if (match(new RegExp(`^/api/videos/${ID}/view$`)) && method === 'POST') return countView(request, env, m[1]);
+  if (match(new RegExp(`^/api/videos/${ID}/transcript$`)) && method === 'GET') return getTranscript(request, env, m[1]);
 
   if (!path.startsWith('/api/')) return new Response('Not found', { status: 404 });
 
@@ -56,15 +73,17 @@ async function route(request, env, ctx) {
 
   if (path === '/api/videos' && method === 'GET') return listVideos(env);
   if (path === '/api/videos' && method === 'POST') return createVideo(request, env, url);
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})$/))) {
-    if (method === 'GET') return json(publicVideo(await getVideo(env, m[1]), url));
+  if (match(new RegExp(`^/api/videos/${ID}$`))) {
+    if (method === 'GET') return json(publicVideo(await getVideo(env, m[1]), url, true));
     if (method === 'PATCH') return patchVideo(request, env, m[1], url);
     if (method === 'DELETE') return deleteVideo(env, m[1]);
   }
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/parts\/(\d{1,5})$/)) && method === 'PUT') return uploadPart(request, env, m[1], Number(m[2]));
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/complete$/)) && method === 'POST') return completeVideo(request, env, m[1], url);
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/thumb$/)) && method === 'PUT') return putThumb(request, env, m[1]);
-  if ((m = path.match(/^\/api\/videos\/([A-Za-z0-9]{6,32})\/heartbeat$/)) && method === 'POST') {
+  if (match(new RegExp(`^/api/videos/${ID}/parts/(\\d{1,5})$`)) && method === 'PUT') return uploadPart(request, env, m[1], Number(m[2]), url.searchParams.get('track') || 'main');
+  if (match(new RegExp(`^/api/videos/${ID}/complete$`)) && method === 'POST') return completeVideo(request, env, m[1], url);
+  if (match(new RegExp(`^/api/videos/${ID}/thumb$`)) && method === 'PUT') return putThumb(request, env, m[1], url.searchParams.get('variant') || 'poster');
+  if (match(new RegExp(`^/api/videos/${ID}/audio/(\\d{1,5})$`)) && method === 'PUT') return putAudio(request, env, ctx, m[1], Number(m[2]));
+  if (match(new RegExp(`^/api/videos/${ID}/transcript/retry$`)) && method === 'POST') return retryTranscript(env, m[1]);
+  if (match(new RegExp(`^/api/videos/${ID}/heartbeat$`)) && method === 'POST') {
     await env.DB.prepare("UPDATE videos SET updated_at = ? WHERE id = ? AND status = 'recording'").bind(Date.now(), m[1]).run();
     return json({ ok: true });
   }
@@ -137,48 +156,56 @@ async function createVideo(request, env, url) {
   const body = await readJson(request);
   const mime = String(body.mime || '');
   if (!ALLOWED_MIME.test(mime)) throw new HttpError(400, 'Unsupported video type');
+  const camMime = body.camMime ? String(body.camMime) : null;
+  if (camMime && !ALLOWED_MIME.test(camMime)) throw new HttpError(400, 'Unsupported camera video type');
   const mode = ['screen-camera', 'screen', 'camera'].includes(body.mode) ? body.mode : 'screen-camera';
   const id = newId(12);
   const title = cleanTitle(body.title) || defaultTitle(body.tz);
-  const upload = await env.VIDEOS.createMultipartUpload(videoKey(id), {
-    httpMetadata: { contentType: mime.split(';')[0] },
-  });
+  const main = await env.VIDEOS.createMultipartUpload(videoKey(id, 'main'), { httpMetadata: { contentType: mime.split(';')[0] } });
+  let camUploadId = null;
+  if (camMime && mode === 'screen-camera') {
+    const cam = await env.VIDEOS.createMultipartUpload(videoKey(id, 'cam'), { httpMetadata: { contentType: camMime.split(';')[0] } });
+    camUploadId = cam.uploadId;
+  }
+  const layout = JSON.stringify(cleanLayout(body.layout) || DEFAULT_LAYOUT);
   const now = Date.now();
   await env.DB.prepare(
-    'INSERT INTO videos (id, title, mode, mime, status, upload_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  ).bind(id, title, mode, mime.split(';')[0], 'recording', upload.uploadId, now, now).run();
-  return json({ id, title, partSize: PART_SIZE, shareUrl: `${url.origin}/v/${id}` }, 201);
+    `INSERT INTO videos (id, title, mode, mime, status, upload_id, cam_mime, cam_upload_id, surface, layout, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(id, title, mode, mime.split(';')[0], main.uploadId, camUploadId ? camMime.split(';')[0] : null, camUploadId,
+    cleanSurface(body.surface), layout, now, now).run();
+  return json({ id, title, partSize: PART_SIZE, shareUrl: `${url.origin}/v/${id}`, hasCam: !!camUploadId }, 201);
 }
 
-async function uploadPart(request, env, id, n) {
+async function uploadPart(request, env, id, n, track) {
+  if (!TRACKS.includes(track)) throw new HttpError(400, 'Bad track');
   if (n < 1 || n > 10000) throw new HttpError(400, 'Bad part number');
   const v = await getVideo(env, id);
-  if (v.status !== 'recording' || !v.upload_id) throw new HttpError(409, 'This recording is already finished');
+  const uploadId = track === 'cam' ? v.cam_upload_id : v.upload_id;
+  if (v.status !== 'recording' || !uploadId) throw new HttpError(409, 'This recording is already finished');
   const len = Number(request.headers.get('Content-Length') || 0);
   if (!request.body) throw new HttpError(400, 'Empty part');
   if (len && len > PART_SIZE) throw new HttpError(400, 'Part too large');
-  const upload = env.VIDEOS.resumeMultipartUpload(videoKey(id), v.upload_id);
   // R2 needs a known length; buffer the (≤5 MiB) part.
   const bytes = await request.arrayBuffer();
   if (bytes.byteLength === 0) throw new HttpError(400, 'Empty part');
   if (bytes.byteLength > PART_SIZE) throw new HttpError(400, 'Part too large');
-  const part = await upload.uploadPart(n, bytes);
-  await env.DB.prepare('INSERT OR REPLACE INTO parts (video_id, n, etag, size) VALUES (?, ?, ?, ?)')
-    .bind(id, n, part.etag, bytes.byteLength).run();
-  await env.DB.prepare('UPDATE videos SET updated_at = ? WHERE id = ?').bind(Date.now(), id).run();
-  return json({ partNumber: n, etag: part.etag });
+  const part = await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId).uploadPart(n, bytes);
+  await env.DB.batch([
+    env.DB.prepare('INSERT OR REPLACE INTO parts (video_id, track, n, etag, size) VALUES (?, ?, ?, ?, ?)').bind(id, track, n, part.etag, bytes.byteLength),
+    env.DB.prepare('UPDATE videos SET updated_at = ? WHERE id = ?').bind(Date.now(), id),
+  ]);
+  return json({ partNumber: n, etag: part.etag, track });
 }
 
-async function completeVideo(request, env, id, url) {
-  const body = await readJson(request);
-  const v = await getVideo(env, id);
-  if (v.status === 'ready') return json(publicVideo(v, url));
-  const { results } = await env.DB.prepare('SELECT n, etag, size FROM parts WHERE video_id = ? ORDER BY n').bind(id).all();
+// Closes one track's multipart upload from the parts recorded in D1.
+// Returns { size, truncated } or null when the track has no data.
+async function completeTrack(env, id, track, uploadId) {
+  const { results } = await env.DB.prepare('SELECT n, etag, size FROM parts WHERE video_id = ? AND track = ? ORDER BY n').bind(id, track).all();
   if (!results.length) {
     // A previous complete may have finished in R2 but not here.
-    const existing = await env.VIDEOS.head(videoKey(id));
-    if (existing) return markReady(env, id, v, existing.size, body, url, false);
-    throw new HttpError(409, 'Nothing has been uploaded for this video yet');
+    const existing = await env.VIDEOS.head(videoKey(id, track));
+    return existing ? { size: existing.size, truncated: false } : null;
   }
   // Parts must be contiguous from 1, and all but the last exactly PART_SIZE.
   const usable = [];
@@ -187,60 +214,96 @@ async function completeVideo(request, env, id, url) {
     usable.push(results[i]);
     if (results[i].size !== PART_SIZE) break;
   }
-  let size;
   try {
-    const upload = env.VIDEOS.resumeMultipartUpload(videoKey(id), v.upload_id);
-    const obj = await upload.complete(usable.map((p) => ({ partNumber: p.n, etag: p.etag })));
-    size = obj.size;
+    const obj = await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId)
+      .complete(usable.map((p) => ({ partNumber: p.n, etag: p.etag })));
+    return { size: obj.size, truncated: usable.length < results.length };
   } catch (err) {
     // Already completed by an earlier attempt that died before updating D1?
-    const existing = await env.VIDEOS.head(videoKey(id));
+    const existing = await env.VIDEOS.head(videoKey(id, track));
     if (!existing) throw err;
-    size = existing.size;
+    return { size: existing.size, truncated: usable.length < results.length };
   }
-  return markReady(env, id, v, size, body, url, usable.length < results.length);
 }
 
-async function markReady(env, id, v, size, body, url, truncated) {
-  const durationMs = clampInt(body.durationMs, 0, 1e9);
+async function completeVideo(request, env, id, url) {
+  const body = await readJson(request);
+  const v = await getVideo(env, id);
+  if (v.status === 'ready') return json(publicVideo(v, url, true));
+  const main = await completeTrack(env, id, 'main', v.upload_id);
+  if (!main) throw new HttpError(409, 'Nothing has been uploaded for this video yet');
+  let cam = null;
+  if (v.cam_upload_id) {
+    try { cam = await completeTrack(env, id, 'cam', v.cam_upload_id); } catch (e) { console.error('camera track:', e && e.message); }
+    if (!cam) { try { await env.VIDEOS.resumeMultipartUpload(videoKey(id, 'cam'), v.cam_upload_id).abort(); } catch {} }
+  }
   const mime = typeof body.mime === 'string' && ALLOWED_MIME.test(body.mime) ? body.mime.split(';')[0] : v.mime;
+  const camMime = cam ? (typeof body.camMime === 'string' && ALLOWED_MIME.test(body.camMime) ? body.camMime.split(';')[0] : v.cam_mime) : null;
   await env.DB.batch([
     env.DB.prepare(
-      "UPDATE videos SET status = 'ready', upload_id = NULL, mime = ?, size = ?, duration_ms = ?, width = ?, height = ?, updated_at = ? WHERE id = ?"
-    ).bind(mime, size, durationMs, clampInt(body.width, 0, 20000), clampInt(body.height, 0, 20000), Date.now(), id),
+      `UPDATE videos SET status = 'ready', upload_id = NULL, cam_upload_id = NULL, mime = ?, size = ?, duration_ms = ?, width = ?, height = ?,
+         cam_mime = ?, cam_size = ?, cam_offset_ms = ?, cam_muted_ms = ?, surface = COALESCE(NULLIF(?, ''), surface),
+         audio_chunks = ?, tap_gap_ms = ?, updated_at = ? WHERE id = ?`
+    ).bind(mime, main.size, clampInt(body.durationMs, 0, 1e9), clampInt(body.width, 0, 20000), clampInt(body.height, 0, 20000),
+      camMime, cam ? cam.size : 0, clampInt(body.camOffsetMs, -10000, 10000), clampInt(body.camMutedMs, 0, 1e9),
+      cleanSurface(body.surface), body.audioChunks === undefined ? -1 : clampInt(body.audioChunks, 0, 100000),
+      clampInt(body.tapGapMs, 0, 1e9), Date.now(), id),
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
   ]);
-  return json({ ...publicVideo(await getVideo(env, id), url), truncated });
+  return json({ ...publicVideo(await getVideo(env, id), url, true), truncated: main.truncated || !!(cam && cam.truncated) });
 }
 
-async function putThumb(request, env, id) {
+async function putThumb(request, env, id, variant) {
+  if (!THUMBS.includes(variant)) throw new HttpError(400, 'Bad thumbnail variant');
   await getVideo(env, id);
   const bytes = await request.arrayBuffer();
   if (!bytes.byteLength || bytes.byteLength > 2 * 1024 * 1024) throw new HttpError(400, 'Bad thumbnail');
-  await env.VIDEOS.put(thumbKey(id), bytes, { httpMetadata: { contentType: 'image/jpeg' } });
-  await env.DB.prepare('UPDATE videos SET has_thumb = 1, updated_at = ? WHERE id = ?').bind(Date.now(), id).run();
+  await env.VIDEOS.put(thumbKey(id, variant), bytes, { httpMetadata: { contentType: 'image/jpeg' } });
+  const col = { poster: 'has_thumb', cam: 'has_cam_thumb', og: 'has_og' }[variant];
+  await env.DB.prepare(`UPDATE videos SET ${col} = 1, updated_at = ? WHERE id = ?`).bind(Date.now(), id).run();
   return json({ ok: true });
 }
 
 async function patchVideo(request, env, id, url) {
   const body = await readJson(request);
-  await getVideo(env, id);
+  const v = await getVideo(env, id);
+  const sets = [], args = [];
   if (body.title !== undefined) {
     const t = cleanTitle(body.title);
     if (!t) throw new HttpError(400, 'Title can’t be empty');
-    await env.DB.prepare('UPDATE videos SET title = ?, updated_at = ? WHERE id = ?').bind(t, Date.now(), id).run();
+    sets.push('title = ?'); args.push(t);
   }
-  return json(publicVideo(await getVideo(env, id), url));
+  if (body.layout !== undefined) {
+    const l = cleanLayout(body.layout);
+    if (!l) throw new HttpError(400, 'Bad layout');
+    sets.push('layout = ?'); args.push(JSON.stringify(l));
+  }
+  if (body.cuts !== undefined) {
+    if (!Array.isArray(body.cuts) || body.cuts.length > 5000) throw new HttpError(400, 'Bad cuts');
+    const dur = v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7;
+    sets.push('cuts = ?'); args.push(JSON.stringify(normalizeCuts(body.cuts, dur)));
+  }
+  if (sets.length) {
+    sets.push('updated_at = ?'); args.push(Date.now());
+    await env.DB.prepare(`UPDATE videos SET ${sets.join(', ')} WHERE id = ?`).bind(...args, id).run();
+  }
+  return json(publicVideo(await getVideo(env, id), url, true));
 }
 
 async function deleteVideo(env, id) {
   const v = await getVideo(env, id);
-  if (v.status === 'recording' && v.upload_id) {
-    try { await env.VIDEOS.resumeMultipartUpload(videoKey(id), v.upload_id).abort(); } catch {}
+  for (const [track, uploadId] of [['main', v.upload_id], ['cam', v.cam_upload_id]]) {
+    if (v.status === 'recording' && uploadId) {
+      try { await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId).abort(); } catch {}
+    }
   }
-  await env.VIDEOS.delete([videoKey(id), thumbKey(id)]);
+  const audio = await env.VIDEOS.list({ prefix: `audio/${id}/` });
+  await env.VIDEOS.delete([
+    videoKey(id, 'main'), videoKey(id, 'cam'), ...THUMBS.map((t) => thumbKey(id, t)), ...audio.objects.map((o) => o.key),
+  ]);
   await env.DB.batch([
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
+    env.DB.prepare('DELETE FROM transcript_chunks WHERE video_id = ?').bind(id),
     env.DB.prepare('DELETE FROM videos WHERE id = ?').bind(id),
   ]);
   return json({ ok: true });
@@ -248,11 +311,11 @@ async function deleteVideo(env, id) {
 
 async function listVideos(env) {
   const { results } = await env.DB.prepare('SELECT * FROM videos ORDER BY created_at DESC LIMIT 500').all();
-  return json({ videos: results.map((v) => publicVideo(v)) });
+  return json({ videos: results.map((v) => publicVideo(v, null, true)) });
 }
 
 async function status(env, id) {
-  const v = await env.DB.prepare('SELECT status, updated_at FROM videos WHERE id = ?').bind(id).first();
+  const v = await env.DB.prepare('SELECT status FROM videos WHERE id = ?').bind(id).first();
   if (!v) throw new HttpError(404, 'Not found');
   return json({ status: v.status });
 }
@@ -263,6 +326,95 @@ async function countView(request, env, id) {
   return json({ ok: true, counted: true });
 }
 
+// ---------- transcripts ----------
+
+// One ~minute of 16 kHz mono WAV, sent while recording. Transcribed in the background.
+async function putAudio(request, env, ctx, id, seq) {
+  const v = await getVideo(env, id);
+  if (v.status !== 'recording' && v.status !== 'ready') throw new HttpError(409, 'Not recording');
+  const startMs = clampInt(request.headers.get('X-Start-Ms'), 0, 1e9);
+  const durationMs = clampInt(request.headers.get('X-Duration-Ms'), 0, 1e7);
+  const silent = request.headers.get('X-Silent') === '1';
+  const bytes = await request.arrayBuffer();
+  if (!silent && (bytes.byteLength < 44 || bytes.byteLength > MAX_AUDIO_CHUNK)) throw new HttpError(400, 'Bad audio chunk');
+  const now = Date.now();
+  const p = provider(env);
+  // Silence skips the model (Whisper invents words on silence), and so does having no provider.
+  const state = silent ? 'ready' : p ? 'pending' : 'off';
+  // Kept even with no provider ('off'), so turning transcription on later can still use it.
+  if (!silent) await env.VIDEOS.put(audioKey(id, seq), bytes, { httpMetadata: { contentType: 'audio/wav' } });
+  await env.DB.prepare(
+    'INSERT OR REPLACE INTO transcript_chunks (video_id, seq, start_ms, duration_ms, status, words, error, updated_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)'
+  ).bind(id, seq, startMs, durationMs, state, state === 'ready' ? '[]' : null, now).run();
+  if (state === 'pending') ctx.waitUntil(runChunk(env, id, seq));
+  return json({ ok: true, status: state });
+}
+
+async function runChunk(env, id, seq) {
+  const row = await env.DB.prepare('SELECT * FROM transcript_chunks WHERE video_id = ? AND seq = ?').bind(id, seq).first();
+  if (!row) return;
+  await env.DB.prepare("UPDATE transcript_chunks SET status = 'pending', updated_at = ? WHERE video_id = ? AND seq = ?").bind(Date.now(), id, seq).run();
+  try {
+    const obj = await env.VIDEOS.get(audioKey(id, seq));
+    if (!obj) throw new Error('audio chunk missing');
+    const words = await transcribeWav(env, await obj.arrayBuffer(), row.duration_ms);
+    const offset = row.start_ms / 1000;
+    const abs = words.map((w) => ({ w: w.w, s: round3(w.s + offset), e: round3(w.e + offset) }));
+    await env.DB.prepare("UPDATE transcript_chunks SET status = 'ready', words = ?, error = NULL, updated_at = ? WHERE video_id = ? AND seq = ?")
+      .bind(JSON.stringify(abs), Date.now(), id, seq).run();
+    await env.VIDEOS.delete(audioKey(id, seq));
+  } catch (e) {
+    console.error('transcribe', id, seq, e && e.message);
+    await env.DB.prepare("UPDATE transcript_chunks SET status = 'failed', error = ?, updated_at = ? WHERE video_id = ? AND seq = ?")
+      .bind(String(e && e.message || e).slice(0, 300), Date.now(), id, seq).run();
+  }
+}
+
+async function transcriptOf(env, id, expected = -1) {
+  const { results } = await env.DB.prepare('SELECT * FROM transcript_chunks WHERE video_id = ? ORDER BY seq').bind(id).all();
+  const now = Date.now();
+  const p = provider(env);
+  // Chunks the recorder made that never arrived (navigated away mid-upload, refused upload).
+  const missing = expected >= 0 ? Math.max(0, expected - results.length) : 0;
+  let st;
+  if (!results.length && !missing) st = 'none';
+  else if (!p && results.some((r) => r.status === 'off')) st = 'off';
+  else if (results.some((r) => r.status === 'pending' && now - r.updated_at < STALE_CHUNK_MS)) st = 'pending';
+  else if (missing || results.some((r) => r.status !== 'ready')) st = 'partial';
+  else st = 'ready';
+  const words = results.flatMap((r) => (r.status === 'ready' && r.words ? JSON.parse(r.words) : [])).sort((a, b) => a.s - b.s);
+  const retryable = results.filter((r) => r.status === 'failed' || r.status === 'off' || (r.status === 'pending' && now - r.updated_at >= STALE_CHUNK_MS)).length;
+  return { status: st, words, failed: retryable, missing };
+}
+
+async function getTranscript(request, env, id) {
+  const v = await env.DB.prepare('SELECT status, cuts, audio_chunks FROM videos WHERE id = ?').bind(id).first();
+  if (!v) throw new HttpError(404, 'Not found');
+  const t = await transcriptOf(env, id, v.status === 'ready' ? v.audio_chunks : -1);
+  if (!(await isOwner(request, env))) {
+    // Viewers never get the words that were cut.
+    const cuts = parseJson(v.cuts, []);
+    t.words = t.words.filter((w) => !isWordCut(w, cuts));
+    delete t.failed;
+    delete t.missing;
+  }
+  return json(t);
+}
+
+// Re-runs failed or stuck chunks, a few per request; the page calls again until done.
+async function retryTranscript(env, id) {
+  const now = Date.now();
+  if (!provider(env)) throw new HttpError(409, 'Transcription isn’t set up on this server');
+  const v = await getVideo(env, id);
+  const { results } = await env.DB.prepare(
+    // Least recently tried first, so a chunk that keeps failing doesn't starve the others.
+    "SELECT seq FROM transcript_chunks WHERE video_id = ? AND (status IN ('failed', 'off') OR (status = 'pending' AND updated_at < ?)) ORDER BY updated_at, seq LIMIT 4"
+  ).bind(id, now - STALE_CHUNK_MS).all();
+  for (const r of results) await runChunk(env, id, r.seq);
+  const t = await transcriptOf(env, id, v.status === 'ready' ? v.audio_chunks : -1);
+  return json({ status: t.status, failed: t.failed, missing: t.missing, retried: results.length });
+}
+
 // ---------- public reads ----------
 
 async function sharePage(request, env, id) {
@@ -271,26 +423,32 @@ async function sharePage(request, env, id) {
   if (!v) return new Response(renderNotFound(), { status: 404, headers });
   const url = new URL(request.url);
   const owner = await isOwner(request, env);
-  return new Response(renderSharePage(publicVideo(v, url), { owner, origin: url.origin }), { headers });
+  return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
 }
 
-async function rawVideo(request, env, id, url) {
-  const v = await env.DB.prepare('SELECT status, mime, title FROM videos WHERE id = ?').bind(id).first();
+async function rawVideo(request, env, id, track, url) {
+  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout FROM videos WHERE id = ?').bind(id).first();
   if (!v || v.status !== 'ready') return new Response('Not found', { status: 404 });
-  const head = await env.VIDEOS.head(videoKey(id));
+  const download = [...url.searchParams.keys()].some((k) => k.toLowerCase() === 'download');
+  if (download && !(await isOwner(request, env))) return new Response('Downloads are for the owner', { status: 403 });
+  // With the Screen layout the camera isn't part of the video, so viewers can't fetch it.
+  if (track === 'cam' && camHidden(v) && !(await isOwner(request, env))) return new Response('Not found', { status: 404 });
+  const key = videoKey(id, track);
+  const head = await env.VIDEOS.head(key);
   if (!head) return new Response('Not found', { status: 404 });
+  const mime = (track === 'cam' ? v.cam_mime : v.mime) || head.httpMetadata?.contentType || 'video/mp4';
   const size = head.size;
   const headers = new Headers({
-    'Content-Type': v.mime,
+    'Content-Type': mime,
     'Accept-Ranges': 'bytes',
     'ETag': head.httpEtag,
-    'Cache-Control': 'public, max-age=300',
+    'Cache-Control': download ? 'private, no-store' : 'public, max-age=300',
     'X-Content-Type-Options': 'nosniff',
   });
-  if (url.searchParams.has('download')) {
-    const ext = v.mime.includes('mp4') ? 'mp4' : v.mime.includes('quicktime') ? 'mov' : 'webm';
+  if (download) {
+    const ext = mime.includes('mp4') ? 'mp4' : mime.includes('quicktime') ? 'mov' : 'webm';
     const name = (v.title || 'video').replace(/[^\w\- .]+/g, '').trim().slice(0, 80) || 'video';
-    headers.set('Content-Disposition', `attachment; filename="${name}.${ext}"`);
+    headers.set('Content-Disposition', `attachment; filename="${name}${track === 'cam' ? ' (camera)' : ''}.${ext}"`);
   }
   const range = parseRange(request.headers.get('Range'), size);
   if (range === 'invalid') {
@@ -302,20 +460,28 @@ async function rawVideo(request, env, id, url) {
     return new Response(null, { status: 200, headers });
   }
   if (range) {
-    const obj = await env.VIDEOS.get(videoKey(id), { range: { offset: range.start, length: range.end - range.start + 1 } });
+    const obj = await env.VIDEOS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } });
     if (!obj) return new Response('Not found', { status: 404 });
     headers.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
     headers.set('Content-Length', String(range.end - range.start + 1));
     return new Response(obj.body, { status: 206, headers });
   }
-  const obj = await env.VIDEOS.get(videoKey(id));
+  const obj = await env.VIDEOS.get(key);
   if (!obj) return new Response('Not found', { status: 404 });
   headers.set('Content-Length', String(size));
   return new Response(obj.body, { status: 200, headers });
 }
 
-async function thumb(env, id) {
-  const obj = await env.VIDEOS.get(thumbKey(id));
+async function thumb(request, env, id, variant) {
+  if (variant !== 'poster') {
+    const v = await env.DB.prepare('SELECT layout FROM videos WHERE id = ?').bind(id).first();
+    if (v && camHidden(v)) {
+      if (variant === 'cam' && !(await isOwner(request, env))) return new Response('Not found', { status: 404 });
+      if (variant === 'og') variant = 'poster'; // the preview without his face
+    }
+  }
+  let obj = await env.VIDEOS.get(thumbKey(id, variant));
+  if (!obj && variant === 'og') obj = await env.VIDEOS.get(thumbKey(id, 'poster'));
   if (!obj) {
     return new Response(PLACEHOLDER_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' } });
   }
@@ -348,18 +514,46 @@ async function getVideo(env, id) {
   return v;
 }
 
-function publicVideo(v, url) {
+// The owner picked the Screen layout: the camera recording is not shown to viewers.
+function camHidden(v) {
+  const l = parseJson(v.layout, null);
+  return !!(l && l.kind === 'screen');
+}
+
+function publicVideo(v, url, owner = false) {
   const out = {
     id: v.id, title: v.title, mode: v.mode, mime: v.mime, status: v.status,
-    size: v.size, durationMs: v.duration_ms, width: v.width, height: v.height,
-    hasThumb: !!v.has_thumb, views: v.views, createdAt: v.created_at, updatedAt: v.updated_at,
+    durationMs: v.duration_ms, width: v.width, height: v.height,
+    hasThumb: !!v.has_thumb, hasCamThumb: !!v.has_cam_thumb, hasOg: !!v.has_og,
+    hasCam: !!(v.cam_mime && (v.cam_size || v.cam_upload_id)), camMime: v.cam_mime || null, camOffsetMs: v.cam_offset_ms || 0,
+    layout: parseJson(v.layout, null) || (v.cam_mime ? DEFAULT_LAYOUT : { kind: 'screen', corner: 'bl', size: 'm' }),
+    cuts: parseJson(v.cuts, []),
+    createdAt: v.created_at,
   };
+  if (!owner && v.cam_mime && camHidden(v)) Object.assign(out, { hasCam: false, hasCamThumb: false, camMime: null });
+  if (owner) {
+    Object.assign(out, {
+      size: v.size, camSize: v.cam_size || 0, views: v.views, updatedAt: v.updated_at,
+      surface: v.surface || '', camMutedMs: v.cam_muted_ms || 0, tapGapMs: v.tap_gap_ms || 0,
+    });
+  }
   if (url) out.shareUrl = `${url.origin}/v/${v.id}`;
   return out;
 }
 
-function videoKey(id) { return `videos/${id}`; }
-function thumbKey(id) { return `thumbs/${id}.jpg`; }
+function cleanLayout(l) {
+  if (!l || typeof l !== 'object') return null;
+  if (!LAYOUT_KINDS.includes(l.kind)) return null;
+  return { kind: l.kind, corner: CORNERS.includes(l.corner) ? l.corner : 'bl', size: SIZES.includes(l.size) ? l.size : 'm' };
+}
+
+function cleanSurface(s) {
+  return ['monitor', 'window', 'browser', 'camera'].includes(s) ? s : '';
+}
+
+function videoKey(id, track = 'main') { return track === 'cam' ? `videos/${id}.cam` : `videos/${id}`; }
+function thumbKey(id, variant = 'poster') { return variant === 'poster' ? `thumbs/${id}.jpg` : `thumbs/${id}.${variant}.jpg`; }
+function audioKey(id, seq) { return `audio/${id}/${String(seq).padStart(5, '0')}.wav`; }
 
 function newId(n) {
   const bytes = crypto.getRandomValues(new Uint8Array(n));
@@ -375,14 +569,19 @@ function cleanTitle(t) {
 function defaultTitle(tz) {
   let zone = 'America/Los_Angeles';
   try { if (tz) { new Intl.DateTimeFormat('en-US', { timeZone: tz }); zone = tz; } } catch {}
-  const d = new Date();
-  const s = new Intl.DateTimeFormat('en-US', { timeZone: zone, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(d);
+  const s = new Intl.DateTimeFormat('en-US', { timeZone: zone, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(new Date());
   return `Recording · ${s}`;
 }
 
 function clampInt(x, lo, hi) {
   const n = Math.round(Number(x));
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : 0;
+}
+
+function round3(x) { return Math.round(x * 1000) / 1000; }
+
+function parseJson(s, fallback) {
+  try { return s ? JSON.parse(s) : fallback; } catch { return fallback; }
 }
 
 async function readJson(request) {

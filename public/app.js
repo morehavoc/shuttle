@@ -1,5 +1,5 @@
 import { $, h, icon, toast, api, fmtDuration, fmtAgo, fmtSize, copyText } from './ui.js';
-import { Session, canRecordScreen, makeThumbnail, pickMime } from './recorder.js';
+import { Session, canRecordScreen, makeThumbs, pickMime } from './recorder.js';
 import { Bubble } from './bubble.js';
 
 const store = {
@@ -72,7 +72,7 @@ function card(v) {
   const meta = [fmtAgo(v.createdAt), v.views ? `${v.views} view${v.views === 1 ? '' : 's'}` : null, fmtSize(v.size)].filter(Boolean).join(' · ');
   const el = h('article', { class: 'card' },
     h('a', { class: 'thumb', href: link },
-      h('img', { src: `/thumb/${v.id}.jpg?v=${v.updatedAt || ''}`, alt: '', loading: 'lazy' }),
+      h('img', { src: `/thumb/${v.id}/og.jpg?v=${v.updatedAt || ''}`, alt: '', loading: 'lazy' }),
       v.status === 'ready' && v.durationMs ? h('span', { class: 'dur' }, fmtDuration(v.durationMs)) : null,
       interrupted ? h('span', { class: 'badge' }, 'Interrupted') : null,
       live ? h('span', { class: 'badge' }, 'Recording') : null,
@@ -195,14 +195,16 @@ function renderPreview() {
   const p = $('#preview', setup.el);
   const camRow = $('#cam-row', setup.el);
   camRow.style.display = needsCamera() ? '' : 'none';
-  const v = h('video', { autoplay: true, muted: true, playsinline: true, id: 'setup-cam' });
+  // No `autoplay` attribute: Safari pauses autoplaying muted video it considers hidden, and
+  // in Safari this element becomes the floating bubble.
+  const v = h('video', { muted: true, playsinline: true, id: 'setup-cam' });
   v.muted = true;
   if (setup.cameraStream) { v.srcObject = setup.cameraStream; v.play().catch(() => {}); }
   if (setup.mode === 'camera') {
     v.className = 'cam-full';
     p.replaceChildren(setup.cameraStream ? v : h('div', { class: 'cam-off' }, setup.camMsg || 'Waiting for camera access…'));
   } else {
-    const hint = h('div', { class: 'screen-hint', html: `${icon.screen}<span>You’ll pick a screen next</span>` });
+    const hint = h('div', { class: 'screen-hint', html: `${icon.screen}<span>Next: pick a window or screen</span>` });
     p.replaceChildren(hint);
     if (setup.mode === 'screen-camera') p.append(h('div', { class: 'bubble' }, setup.cameraStream ? v : null));
   }
@@ -312,17 +314,21 @@ function onStart() {
   setup.busy = true;
   // Screen-only: let the camera go (and its light off).
   if (mode === 'screen') { stopStream('cameraStream'); renderPreview(); }
+  let tapCtx = null;
+  try { tapCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch {}
   const session = new Session({
     mode,
     cameraStream: mode === 'screen' ? null : setup.cameraStream,
     micStream: setup.micOn ? setup.micStream : null,
+    audioCtx: tapCtx,
+    layout: store.get('layout', null),
   });
   // Both of these must start synchronously inside the click.
   const displayP = session.requestDisplay();
   let bubble = null, bubbleP = Promise.resolve(false);
   if (mode === 'screen-camera') {
     bubble = new Bubble(setup.cameraStream);
-    bubbleP = bubble.open($('#setup-cam', setup.el));
+    bubbleP = bubble.open(setupCam());
   }
   run(session, bubble, displayP, bubbleP);
 }
@@ -335,6 +341,7 @@ async function run(session, bubble, displayP, bubbleP) {
   } catch (e) {
     setup.busy = false;
     if (bubble) bubble.close();
+    if (session.audioCtx) session.audioCtx.close().catch(() => {});
     if (e && e.name !== 'NotAllowedError' && e.name !== 'AbortError') toast('Couldn’t capture the screen', { bad: true });
     return;
   }
@@ -345,13 +352,13 @@ async function run(session, bubble, displayP, bubbleP) {
     setup.busy = false;
     session.releaseCapture();
     if (bubble) bubble.close();
+    if (session.audioCtx) session.audioCtx.close().catch(() => {});
     if (e.status === 401) { closeSetup(); return showSignin(); }
     return toast(e.message, { bad: true });
   }
 
-  // Park the setup sheet off-screen rather than removing it: Safari's video PiP
-  // closes if its <video> leaves the document.
-  setup.el.style.cssText = 'position:fixed;left:-10000px;top:0;width:520px;opacity:0;pointer-events:none';
+  // The setup sheet stays where it is, under the recording screen. In Safari its camera
+  // preview IS the floating bubble, and Safari freezes a bubble whose source leaves the screen.
   setup.busy = false;
   document.removeEventListener('keydown', escClose);
   cancelAnimationFrame(setup.meterRaf);
@@ -361,21 +368,41 @@ async function run(session, bubble, displayP, bubbleP) {
   window.addEventListener('beforeunload', guardUnload);
 
   // Safari can refuse the PiP request made alongside the screen picker; one more click opens it.
-  if (bubble && !bubbleOpen) {
+  // Not for a whole-screen share, where the bubble closes as recording starts.
+  if (bubble && !bubbleOpen && keepsBubble(session.surface)) {
     bubbleOpen = await ui.askForBubble(() => bubble.open(setupCam()));
   }
+  const live = () => current && current.session === session; // not cancelled meanwhile
+  if (!live()) return;
   if (bubble) wireBubble(bubble, session);
 
   const go = await ui.countdown(3, bubble);
-  if (!go || session.state !== 'ready') { if (current && current.session === session) await abandon(); return; }
+  if (!live()) return;
+  if (!go || session.state !== 'ready') { await abandon(); return; }
 
+  // Sharing the whole screen would record the floating bubble (and the preview on this page)
+  // next to the real camera track. The bubble did its job for framing during the countdown;
+  // put both away before the first frame.
+  const whole = session.mode === 'screen-camera' && !keepsBubble(session.surface);
+  if (whole) {
+    if (bubble && bubble.isOpen) bubble.close();
+    ui.wholeScreen();
+    document.documentElement.dataset.bubble = 'off-whole-screen';
+    await new Promise((r) => setTimeout(r, 250));
+    if (!live() || session.state !== 'ready') return;
+  }
   try { session.start(); }
   catch (e) { toast(e.message, { bad: true }); await abandon(); return; }
+  if (!whole) document.documentElement.dataset.bubble = bubble && bubble.isOpen ? 'open' : 'none';
   ui.onStarted();
   // A few seconds in, he has usually switched to what he's showing — a better thumbnail
   // (and link preview) than Shuttle's own page.
-  ui.thumbTimer = setTimeout(() => uploadThumb(session, ui), 3000);
+  ui.thumbTimer = setTimeout(() => uploadThumbs(session, ui), 3000);
 }
+
+// A window or tab share doesn't capture the floating bubble; a whole screen (or an unknown
+// surface) would.
+function keepsBubble(surface) { return surface === 'window' || surface === 'browser'; }
 
 function guardUnload(e) {
   if (current && ['ready', 'recording', 'paused', 'stopping', 'failed'].includes(current.session.state)) {
@@ -398,21 +425,24 @@ function wireBubble(bubble, session) {
 function buildStage(session) {
   const isCam = session.mode === 'camera';
   const stage = h('div', { class: 'stage' });
-  const screenVideo = h('video', { autoplay: true, muted: true, playsinline: true });
+  const screenVideo = h('video', { muted: true, playsinline: true });
   screenVideo.muted = true;
-  const camVideo = h('video', { autoplay: true, muted: true, playsinline: true, class: 'mirror' });
+  const camVideo = h('video', { muted: true, playsinline: true, class: 'mirror' });
   camVideo.muted = true;
   if (session.displayStream) { screenVideo.srcObject = session.displayStream; screenVideo.play().catch(() => {}); }
   if (session.cameraStream) { camVideo.srcObject = session.cameraStream; camVideo.play().catch(() => {}); }
-  if (isCam) stage.append(camVideo);
+  const note = h('div', { class: 'stage-note', hidden: true });
+  const camWarn = h('div', { class: 'stage-warn', hidden: true });
+  if (isCam) stage.append(camVideo, camWarn);
   else {
     // The screen itself isn't shown (it would mirror into the recording); kept for the thumbnail.
-    screenVideo.style.cssText = 'position:absolute;width:2px;height:2px;opacity:0;pointer-events:none';
-    camVideo.style.cssText = 'position:absolute;width:2px;height:2px;opacity:0;pointer-events:none';
-    stage.append(screenVideo, camVideo,
-      h('div', { style: 'text-align:center;color:#c9c4dd;display:grid;gap:8px;justify-items:center' },
-        h('div', { style: 'font-size:15px;font-weight:600;color:#fff' }, 'Recording your screen'),
-        h('div', { style: 'font-size:13px' }, 'Switch to what you want to show.'),
+    screenVideo.className = 'stage-hidden';
+    stage.append(screenVideo,
+      h('div', { class: 'stage-center' },
+        session.cameraStream ? h('div', { class: 'stage-self' }, camVideo) : null,
+        h('div', { class: 'stage-title' }, 'Recording'),
+        h('div', { class: 'stage-sub' }, 'Switch to what you want to show.'),
+        note, camWarn,
       ));
   }
   const time = h('span', { class: 'time' }, '0:00');
@@ -431,8 +461,9 @@ function buildStage(session) {
   bar.hidden = true;
   document.body.append(stage, bar);
 
+  let bubbleOff = false;
   function syncBubbleButton() {
-    bubbleBtn.hidden = !(current && current.bubble && !current.bubble.isOpen && session.mode === 'screen-camera');
+    bubbleBtn.hidden = bubbleOff || !(current && current.bubble && !current.bubble.isOpen && session.mode === 'screen-camera');
   }
 
   let interval = 0, heartbeat = 0;
@@ -459,9 +490,23 @@ function buildStage(session) {
     if (current && current.bubble) current.bubble.setStatus(msg);
     if (ui.onProgress) ui.onProgress(p);
   });
+  session.addEventListener('camera', (e) => {
+    camWarn.hidden = !e.detail.muted;
+    camWarn.textContent = e.detail.muted ? 'The browser paused your camera.' : '';
+    if (current && current.bubble) current.bubble.setStatus(e.detail.muted ? 'Camera paused' : '');
+  });
 
   const ui = {
     stage, bar, screenVideo, camVideo, syncBubbleButton, finishing: null, thumbDone: false, thumbTimer: 0,
+    wholeScreen() {
+      bubbleOff = true;
+      syncBubbleButton();
+      // Still rendered (Safari's thumbnail reads it), just not visible to the screen capture.
+      const self = stage.querySelector('.stage-self');
+      if (self) self.classList.add('stage-hidden');
+      note.hidden = false;
+      note.textContent = 'Whole screen: no camera preview, so you aren’t recorded twice. Stop sharing to finish.';
+    },
     onStarted() {
       bar.hidden = false;
       syncBubbleButton();
@@ -514,7 +559,7 @@ function buildStage(session) {
               try { ok = await open(); } catch {}
               done(ok);
             }, html: `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>Start recording` }),
-            h('button', { class: 'btn btn-ghost', type: 'button', style: 'color:#fff', onclick: () => done(false) }, 'Without camera bubble'),
+            h('button', { class: 'btn btn-ghost', type: 'button', style: 'color:#fff', onclick: () => done(false) }, 'Without the floating bubble'),
           ));
         cancelers.add(cancel);
         document.body.append(box);
@@ -533,17 +578,20 @@ function buildStage(session) {
   return ui;
 }
 
-async function uploadThumb(session, ui) {
+async function uploadThumbs(session, ui) {
   if (ui.thumbDone) return;
   ui.thumbDone = true;
   try {
-    const blob = await makeThumbnail({
+    const thumbs = await makeThumbs({
       screenTrack: session.displayStream && session.displayStream.getVideoTracks()[0],
       cameraTrack: session.cameraStream && session.cameraStream.getVideoTracks()[0],
       screenVideo: ui.screenVideo, cameraVideo: ui.camVideo, mode: session.mode,
+      layout: session.video && session.video.hasCam ? (session.layout || { kind: 'bubble', corner: 'bl' }) : null,
     });
-    if (!blob || session.state === 'cancelled') return;
-    await fetch(`/api/videos/${session.video.id}/thumb`, { method: 'PUT', body: blob, credentials: 'same-origin' });
+    for (const [variant, blob] of Object.entries(thumbs)) {
+      if (!blob || session.state === 'cancelled') continue;
+      await fetch(`/api/videos/${session.video.id}/thumb?variant=${variant}`, { method: 'PUT', body: blob, credentials: 'same-origin' });
+    }
   } catch {}
 }
 
@@ -598,8 +646,8 @@ async function finish(doc) {
   const url = session.video.shareUrl;
   // Copy while we still hold the click.
   const copiedP = copyText(url, doc || document);
-  // Short recording: grab the thumbnail before the screen track is released.
-  if (!ui.thumbDone) { clearTimeout(ui.thumbTimer); uploadThumb(session, ui); await new Promise((r) => setTimeout(r, 120)); }
+  // Short recording: grab the thumbnails before the screen track is released.
+  if (!ui.thumbDone) { clearTimeout(ui.thumbTimer); uploadThumbs(session, ui); await new Promise((r) => setTimeout(r, 150)); }
   const stopP = session.stop().catch(() => null);
   const f = finishingOverlay(session, ui, bubble);
   const copied = await copiedP;
@@ -627,11 +675,18 @@ function leave(session, copied) {
 }
 
 function downloadLocal(session) {
-  const blob = session.localBlob();
-  if (!blob.size) return toast('Nothing was recorded', { bad: true });
-  const a = h('a', { href: URL.createObjectURL(blob), download: `shuttle-${session.video.id}.${blob.type.includes('mp4') ? 'mp4' : 'webm'}` });
-  document.body.append(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  const tracks = session.video && session.video.hasCam ? ['main', 'cam'] : ['main'];
+  let any = false;
+  for (const track of tracks) {
+    const blob = session.localBlob(track);
+    if (!blob.size) continue;
+    any = true;
+    const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+    const a = h('a', { href: URL.createObjectURL(blob), download: `shuttle-${session.video.id}${track === 'cam' ? '-camera' : ''}.${ext}` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+  }
+  if (!any) toast('Nothing was recorded', { bad: true });
 }
 
 async function discard(doc, { confirmed = false } = {}) {
@@ -657,5 +712,6 @@ async function abandon() {
   ui.teardown();
   closeSetup();
   await session.cancel();
+  if (session.audioCtx) session.audioCtx.close().catch(() => {});
   renderLibrary();
 }

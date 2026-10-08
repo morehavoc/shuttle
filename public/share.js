@@ -1,20 +1,27 @@
 import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
+import { Player } from './player.js';
+import {
+  normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
+} from './timeline.js';
 
-const { video: v, owner } = window.__SHUTTLE__;
+const { video: v, owner, ownerName } = window.__SHUTTLE__;
 const shareUrl = `${location.origin}/v/${v.id}`;
 const params = new URLSearchParams(location.search);
 if (params.has('new')) history.replaceState(null, '', `/v/${v.id}`);
 
-const player = $('#player');
+let player = null;
+let words = [];
+let cuts = normalizeCuts(v.cuts || []);
+const duration = () => (player && player.duration) || (v.durationMs || 0) / 1000;
 
-// ---------- meta line ----------
-function renderSub(durationMs) {
-  const parts = [new Date(v.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })];
-  if (durationMs) parts.push(fmtDuration(durationMs));
-  if (owner) parts.push(`${v.views} view${v.views === 1 ? '' : 's'}`);
-  $('#sub').textContent = parts.join(' · ');
+// ---------- byline ----------
+function renderWhen() {
+  const date = new Date(v.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  const d = duration();
+  const len = d ? fmtDuration(editedDuration(cuts, d) * 1000) : '';
+  $('#when').textContent = [date, len].filter(Boolean).join(' · ');
 }
-renderSub(v.durationMs);
+renderWhen();
 
 // ---------- actions ----------
 const actions = $('#actions');
@@ -22,36 +29,28 @@ const copyBtn = h('button', { class: 'btn btn-primary', type: 'button', html: `$
   toast((await copyText(shareUrl)) ? 'Link copied' : 'Couldn’t copy', {});
 } });
 actions.append(copyBtn);
-
 if (navigator.share && /iPhone|iPad|Android/i.test(navigator.userAgent)) {
   actions.append(h('button', { class: 'btn', type: 'button', html: `${icon.share}Share`, onclick: () => navigator.share({ title: v.title, url: shareUrl }).catch(() => {}) }));
 }
 
-if (player) {
-  const speeds = [1, 1.25, 1.5, 2];
-  const saved = Number(localStorage.getItem('shuttle.speed')) || 1;
-  const seg = h('div', { class: 'speed', role: 'group', 'aria-label': 'Playback speed' },
-    ...speeds.map((s) => h('button', { type: 'button', 'aria-pressed': String(s === saved), onclick: (e) => setSpeed(s, e.currentTarget) }, `${s}×`)));
-  function setSpeed(s, btn) {
-    player.playbackRate = s;
-    player.defaultPlaybackRate = s;
-    localStorage.setItem('shuttle.speed', String(s));
-    seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
-  }
-  player.playbackRate = saved;
-  player.defaultPlaybackRate = saved;
-  actions.append(seg);
-  actions.append(h('a', { class: 'btn', href: `/raw/${v.id}?download=1`, html: `${icon.download}Download` }));
-}
-
 if (owner) {
+  $('#top-actions').append(h('a', { class: 'btn', href: '/' }, 'Library'));
+  if (v.status === 'ready') {
+    const dl = h('div', { class: 'menu-wrap' });
+    const menu = h('div', { class: 'menu', hidden: true },
+      h('a', { href: `/raw/${v.id}?download=1` }, v.hasCam ? 'Screen and audio' : 'Video'),
+      v.hasCam ? h('a', { href: `/raw/${v.id}/cam?download=1` }, 'Camera') : null);
+    const btn = h('button', { class: 'btn', type: 'button', html: `${icon.download}Download`, onclick: (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; } });
+    document.addEventListener('click', () => { menu.hidden = true; });
+    dl.append(btn, menu);
+    actions.append(dl);
+  }
   actions.append(h('span', { class: 'spacer' }));
   actions.append(h('button', { class: 'btn btn-ghost btn-danger', type: 'button', html: `${icon.trash}Delete`, onclick: async () => {
     if (!confirm('Delete this video? The link will stop working.')) return;
     try { await api(`/api/videos/${v.id}`, { method: 'DELETE' }); location.href = '/'; }
     catch (e) { toast(e.message, { bad: true }); }
   } }));
-  $('#top-actions').append(h('a', { class: 'btn', href: '/' }, 'Library'));
 
   // Rename in place.
   const title = $('#title');
@@ -71,7 +70,7 @@ if (owner) {
     try {
       const out = await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { title: next } });
       title.textContent = out.title;
-      document.title = `${out.title} · Shuttle`;
+      document.title = `${out.title}${ownerName ? ` · ${ownerName}` : ''}`;
       toast('Renamed');
     } catch (e) { title.textContent = before; toast(e.message, { bad: true }); }
   });
@@ -82,38 +81,306 @@ if (params.has('new')) {
   else copyBtn.focus();
 }
 
-// ---------- player ----------
-if (player) {
-  // MediaRecorder files often carry no duration; force the browser to find it so the scrubber works.
-  const fixDuration = () => {
-    if (player.duration === Infinity || Number.isNaN(player.duration)) {
-      const restore = () => {
-        if (player.duration === Infinity) return;
-        player.removeEventListener('durationchange', restore);
-        player.currentTime = 0;
-      };
-      player.addEventListener('durationchange', restore);
-      try { player.currentTime = 1e101; } catch {}
-    } else if (!v.durationMs && player.duration) {
-      renderSub(player.duration * 1000);
-    }
-  };
-  player.addEventListener('loadedmetadata', fixDuration);
+// ---------- owner: layout ----------
+const LAYOUTS = [
+  { kind: 'bubble', label: 'Bubble' },
+  { kind: 'card', label: 'Card' },
+  { kind: 'side', label: 'Side' },
+  { kind: 'screen', label: 'Screen' },
+];
 
-  let counted = false;
+function ownerPanel() {
+  const panel = $('#owner-panel');
+  const parts = [];
+  if (v.camMutedMs > 2000) {
+    parts.push(h('div', { class: 'notice' },
+      `The camera stopped for ${fmtDuration(v.camMutedMs)} of this recording.`));
+  }
+  if (v.hasCam && v.mode === 'screen-camera') {
+    let layout = { kind: 'bubble', corner: 'bl', size: 'm', ...(v.layout || {}) };
+    const save = async () => {
+      player.setLayout(layout);
+      sync();
+      try {
+        await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { layout } });
+        localStorage.setItem('shuttle.layout', JSON.stringify(layout)); // the next recording starts here
+      } catch (e) { toast(e.message, { bad: true }); }
+    };
+    const kinds = h('div', { class: 'seg seg-inline', role: 'group', 'aria-label': 'Layout' },
+      ...LAYOUTS.map((l) => h('button', { type: 'button', 'data-kind': l.kind, onclick: () => { layout = { ...layout, kind: l.kind }; save(); } }, l.label)));
+    const corners = h('div', { class: 'corners', role: 'group', 'aria-label': 'Corner' },
+      ...['tl', 'tr', 'bl', 'br'].map((c) => h('button', { type: 'button', 'data-corner': c, 'aria-label': { tl: 'Top left', tr: 'Top right', bl: 'Bottom left', br: 'Bottom right' }[c], onclick: () => { layout = { ...layout, corner: c }; save(); } }, h('i'))));
+    const sizes = h('div', { class: 'seg seg-inline seg-small', role: 'group', 'aria-label': 'Size' },
+      ...['s', 'm', 'l'].map((s) => h('button', { type: 'button', 'data-size': s, onclick: () => { layout = { ...layout, size: s }; save(); } }, s.toUpperCase())));
+    const sync = () => {
+      kinds.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.kind === layout.kind)));
+      corners.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.corner === layout.corner)));
+      sizes.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.size === layout.size)));
+      const placed = layout.kind === 'bubble' || layout.kind === 'card';
+      corners.hidden = !placed;
+      sizes.hidden = !placed;
+    };
+    sync();
+    parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
+  }
+  if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
+}
+
+// ---------- transcript ----------
+const card = $('#transcript');
+let editing = false;
+let undoStack = [];
+let saveTimer = 0;
+let wordEls = [];
+let activeIdx = -1;
+let toRetry = 0; // chunks the last transcript load said could be tried again
+
+async function loadTranscript() {
+  let t;
+  for (let i = 0; i < 90; i++) {
+    try { t = await api(`/api/videos/${v.id}/transcript`); } catch { return; }
+    if (t.status !== 'pending') break;
+    renderTranscriptShell('pending');
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (!t || t.status === 'none') {
+    if (owner && v.tapGapMs > 3000) renderTranscriptShell('missed');
+    return;
+  }
+  if (t.status === 'off') { if (owner) renderTranscriptShell('off'); return; }
+  words = t.words || [];
+  player.setWords(words);
+  renderTranscript(t);
+}
+
+function renderTranscriptShell(state) {
+  card.hidden = false;
+  const msg = state === 'pending' ? 'Transcribing…'
+    : state === 'missed' ? 'No transcript: the browser didn’t pass the audio to Shuttle while recording.'
+    : 'Transcripts aren’t set up on this server. The audio is kept, so this one can be transcribed later.';
+  card.replaceChildren(h('div', { class: 'tc-head' }, h('h2', {}, 'Transcript')), h('p', { class: 'muted tc-msg' }, msg));
+}
+
+function renderTranscript(t) {
+  card.hidden = false;
+  toRetry = t.failed || 0;
+  const head = h('div', { class: 'tc-head' }, h('h2', {}, 'Transcript'));
+  const tools = h('div', { class: 'tc-tools' });
+  head.append(tools);
+  const body = h('div', { class: 'tc-body', id: 'tc-body' });
+  const children = [head];
+  if (owner) {
+    const retry = (label) => h('button', { class: 'linkish', type: 'button', onclick: retryTranscript }, label);
+    if (t.status === 'partial' && t.failed && !words.length) children.push(h('div', { class: 'notice' }, 'Not transcribed yet. ', retry('Transcribe')));
+    else if (t.status === 'partial' && t.failed) children.push(h('div', { class: 'notice' }, 'Part of the transcript didn’t come through. ', retry('Retry')));
+    else if (t.missing || v.tapGapMs > 3000) children.push(h('div', { class: 'notice' }, 'Some audio didn’t reach the transcript, so it has gaps.'));
+  }
+  if (!words.length) children.push(h('p', { class: 'muted tc-msg' }, 'No speech.'));
+  children.push(body);
+  card.replaceChildren(...children);
+  if (owner && words.length) renderEditTools(tools);
+  renderWords();
+}
+
+function renderWords() {
+  const body = $('#tc-body');
+  if (!body) return;
+  wordEls = [];
+  const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], cuts));
+  const paras = paragraphs(visible.map((i) => words[i]));
+  body.replaceChildren(...paras.map((idxs) => {
+    const first = words[visible[idxs[0]]];
+    const p = h('p', { class: 'tc-p' }, h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, cuts)) * 1000)));
+    for (const k of idxs) {
+      const i = visible[k];
+      const w = words[i];
+      const span = h('span', { class: 'w', 'data-i': String(i) }, w.w);
+      if (isWordCut(w, cuts)) span.classList.add('cut');
+      wordEls[i] = span;
+      p.append(span, ' ');
+    }
+    return p;
+  }));
+  body.classList.toggle('editing', editing);
+}
+
+// Click a word to jump there (outside edit selections).
+card.addEventListener('click', (e) => {
+  const span = e.target.closest('.w');
+  if (!span || !player) return;
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  const w = words[Number(span.dataset.i)];
+  if (w) player.seekSource(w.s);
+});
+
+// Highlight the word being spoken.
+function followPlayback() {
+  if (!player) return;
+  player.addEventListener('time', (e) => {
+    const t = e.detail.source;
+    let idx = -1;
+    for (let i = 0; i < words.length; i++) { if (words[i].s <= t + 0.05) idx = i; else break; }
+    if (idx === activeIdx) return;
+    if (wordEls[activeIdx]) wordEls[activeIdx].classList.remove('now');
+    activeIdx = idx;
+    if (wordEls[idx]) wordEls[idx].classList.add('now');
+  });
+}
+// ---------- owner: transcript editing ----------
+function renderEditTools(tools) {
+  const editBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setEditing(!editing) }, 'Edit');
+  const extra = h('div', { class: 'tc-edit-tools', hidden: true },
+    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(fillerCuts(words, duration())), 'Filler words removed') }, 'Remove ums'),
+    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(pauseCuts(words, cuts, duration())), 'Pauses shortened') }, 'Shorten pauses'),
+    h('button', { class: 'btn btn-sm', type: 'button', id: 'undo', onclick: undo, disabled: true }, 'Undo'),
+    h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], 'All edits removed') }, 'Restore all'),
+  );
+  tools.append(extra, editBtn);
+  function setEditing(on) {
+    editing = on;
+    editBtn.textContent = on ? 'Done' : 'Edit';
+    editBtn.classList.toggle('btn-primary', on);
+    extra.hidden = !on;
+    $('#tc-body').classList.toggle('editing', on);
+    if (!on) hideSelTools();
+  }
+}
+
+function addAll(ranges) {
+  let c = cuts;
+  for (const r of ranges) c = addCut(c, r, duration());
+  return c;
+}
+
+function apply(next, message, { record = true } = {}) {
+  if (record) {
+    undoStack.push(cuts);
+    if (undoStack.length > 100) undoStack.shift();
+  }
+  cuts = normalizeCuts(next, duration());
+  player.setCuts(cuts);
+  for (let i = 0; i < words.length; i++) if (wordEls[i]) wordEls[i].classList.toggle('cut', isWordCut(words[i], cuts));
+  const undoBtn = $('#undo');
+  if (undoBtn) undoBtn.disabled = !undoStack.length;
+  renderWhen();
+  if (message) toast(message);
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 400);
+}
+
+function undo() {
+  if (!undoStack.length) return;
+  apply(undoStack.pop(), 'Undone', { record: false });
+}
+
+async function save() {
+  try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts } }); }
+  catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+}
+
+// One pass over the chunks that need it (the server hands out four at a time, least recently
+// tried first), then show what came of it.
+async function retryTranscript(e) {
+  if (e && e.target) { e.target.disabled = true; e.target.textContent = 'Working…'; }
+  const rounds = Math.min(30, Math.max(1, Math.ceil(toRetry / 4)));
+  for (let i = 0; i < rounds; i++) {
+    let r;
+    try { r = await api(`/api/videos/${v.id}/transcript/retry`, { method: 'POST' }); } catch (err) { toast(err.message, { bad: true }); break; }
+    if (!r.retried || r.status === 'ready') break;
+  }
+  loadTranscript();
+}
+
+// Selected words → [i, j] indices, or null.
+function selectedRange() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const body = $('#tc-body');
+  if (!body) return null;
+  const range = sel.getRangeAt(0);
+  if (!body.contains(range.commonAncestorContainer)) return null;
+  const idx = [];
+  body.querySelectorAll('.w').forEach((el) => { if (range.intersectsNode(el)) idx.push(Number(el.dataset.i)); });
+  if (!idx.length) return null;
+  return [Math.min(...idx), Math.max(...idx)];
+}
+
+let selTools = null;
+let selectionTimer = 0;
+function hideSelTools() { if (selTools) { selTools.remove(); selTools = null; } }
+
+document.addEventListener('selectionchange', () => {
+  if (!editing) return;
+  clearTimeout(selectionTimer);
+  selectionTimer = setTimeout(showSelTools, 120);
+});
+
+function showSelTools() {
+  hideSelTools();
+  const r = selectedRange();
+  if (!r) return;
+  const [i, j] = r;
+  const anyKept = words.slice(i, j + 1).some((w) => !isWordCut(w, cuts));
+  const anyCut = words.slice(i, j + 1).some((w) => isWordCut(w, cuts));
+  const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
+  selTools = h('div', { class: 'sel-tools' },
+    anyKept ? h('button', { class: 'btn btn-sm btn-primary', type: 'button', onmousedown: (e) => e.preventDefault(), onclick: () => cutSel(i, j) }, 'Cut') : null,
+    anyCut ? h('button', { class: 'btn btn-sm', type: 'button', onmousedown: (e) => e.preventDefault(), onclick: () => restoreSel(i, j) }, 'Restore') : null,
+  );
+  document.body.append(selTools);
+  const tw = selTools.offsetWidth;
+  selTools.style.left = `${Math.max(8, Math.min(window.innerWidth - tw - 8, rect.left + rect.width / 2 - tw / 2 + window.scrollX))}px`;
+  selTools.style.top = `${rect.top + window.scrollY - selTools.offsetHeight - 8}px`;
+}
+
+function cutSel(i, j) {
+  apply(addCut(cuts, wordRange(words, i, j, duration()), duration()));
+  window.getSelection().removeAllRanges();
+  hideSelTools();
+}
+
+function restoreSel(i, j) {
+  apply(removeCut(cuts, wordRange(words, i, j, duration()), duration()));
+  window.getSelection().removeAllRanges();
+  hideSelTools();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!editing) return;
+  if ((e.key === 'Backspace' || e.key === 'Delete') && selectedRange()) {
+    e.preventDefault();
+    const [i, j] = selectedRange();
+    cutSel(i, j);
+  } else if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+    e.preventDefault();
+    undo();
+  }
+});
+
+// Player shortcuts work anywhere on the page that isn't a text field.
+document.addEventListener('keydown', (e) => {
+  if (!player || e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t !== document.body && !(t.closest && t.closest('.sp, .tc-body'))) return;
+  if (t.closest && t.closest('.sp')) return; // the player handles its own keys
+  if (editing && (e.key === 'Backspace' || e.key === 'Delete')) return;
+  player.onKey(e);
+});
+
+// ---------- player (started last, once everything above is defined) ----------
+function init() {
+if (v.status === 'ready') {
+  player = new Player($('#player-host'), { video: v, ownerName, owner });
+  let counted = owner;
   player.addEventListener('play', () => {
     if (counted) return;
     counted = true;
     fetch(`/api/videos/${v.id}/view`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
   });
-
-  document.addEventListener('keydown', (e) => {
-    if (e.target.isContentEditable || /INPUT|TEXTAREA|SELECT|BUTTON/.test(e.target.tagName)) return;
-    if (e.key === ' ' || e.key === 'k') { e.preventDefault(); player.paused ? player.play() : player.pause(); }
-    else if (e.key === 'ArrowRight' || e.key === 'l') player.currentTime = Math.min(player.duration || 1e9, player.currentTime + 5);
-    else if (e.key === 'ArrowLeft' || e.key === 'j') player.currentTime = Math.max(0, player.currentTime - 5);
-    else if (e.key === 'f') { (player.requestFullscreen || player.webkitEnterFullscreen || (() => {})).call(player); }
-  });
+  player.main.addEventListener('loadedmetadata', renderWhen);
+  if (owner) ownerPanel();
+  loadTranscript();
 } else {
   // Still uploading: wait, then reload into the player.
   const started = Date.now();
@@ -129,3 +396,7 @@ if (player) {
   };
   setTimeout(poll, 1500);
 }
+}
+
+init();
+followPlayback();

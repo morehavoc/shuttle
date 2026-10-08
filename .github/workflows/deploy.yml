@@ -3,6 +3,7 @@
 #
 # Repo secrets (Settings → Secrets and variables → Actions):
 #   CLOUDFLARE_API_TOKEN   account token with: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit
+#                          (if the deploy fails on the AI binding, add Workers AI Read)
 #   CLOUDFLARE_ACCOUNT_ID
 #   OWNER_PASSWORD         the password you sign in with
 # SESSION_SECRET is generated on the first deploy and never leaves Cloudflare.

@@ -1,22 +1,33 @@
 # Shuttle
 
-Record your screen and camera, get a link. A small Loom clone on Cloudflare: one Worker, an R2 bucket for video, a D1 database for metadata. No build step.
+Record your screen and camera, get a link. A small Loom clone on Cloudflare: one Worker, an R2 bucket for video, a D1 database for metadata, Workers AI for transcripts. No build step.
 
 ## What it does
 
-- **Three modes:** screen + camera bubble, screen only, camera only. Mic and tab/system audio are mixed in.
-- **Camera bubble** floats above every app (Document Picture-in-Picture in Chrome/Edge, video PiP in Safari), so a whole-screen recording captures it. The bubble carries the timer, pause, stop and delete. Share **Entire screen** to get the bubble in the video. If you share a single window or tab, the bubble isn't in it.
-- **Instant link.** The video uploads in 5 MiB parts *while* you record. Stop copies the link and opens the share page a few seconds later.
-- **Plays everywhere.** Chrome and Safari both record H.264/AAC MP4, so links play on iPhones.
-- **Share page** at `/v/<id>`. It has link-preview tags (title and thumbnail in iMessage, Slack and LinkedIn), speed controls (1×–2×, remembered), download, and keyboard shortcuts (space/k, j/l, f). As the owner you can rename it in place and delete it. The view count ignores your own views.
-- **Library:** thumbnails, durations, view counts, copy link and delete.
+- **Three modes:** screen + camera, screen only, camera only. Mic and tab/system audio are mixed in.
+- **The camera is its own recording.** Screen + camera records two files side by side: the screen (with all the audio) and the camera. The share page composites them, so the camera never depends on a floating window being captured.
+- **Layouts**, picked per video on the share page and remembered for the next one: **Bubble** (round, any corner, S/M/L), **Card** (rounded portrait), **Side** (screen framed, camera beside it) and **Screen** (no camera; viewers can't fetch the camera file, its thumbnail or a preview with your face).
+- **Floating bubble** while recording: a self-view (Document Picture-in-Picture in Chrome/Edge, video PiP in Safari) with timer, pause, stop and delete. For a window or tab share it stays up. For a whole-screen share it closes when recording starts, and the on-page preview is hidden, so you aren't recorded twice.
+- **Instant link.** Both files upload in 5 MiB parts *while* you record. Stop copies the link and opens the share page a few seconds later.
+- **Transcript** while you record: the audio is cut into half-minute chunks at quiet moments and transcribed as it goes. Chunk positions are measured against the recording, and word edges next to pauses are snapped to the audio.
+- **Editing from the transcript** (owner): select words and cut them, **Remove ums**, **Shorten pauses** (pauses of 1–8 s; a longer silence is usually you showing something), undo, restore all. Captions come from the same words.
+- **Share page** at `/v/<id>`. It has:
+  - link-preview tags;
+  - speed (1×–2×), captions, keyboard shortcuts;
+  - a transcript that jumps on click;
+  - for the owner: rename, delete, layout and **Download** (screen and camera files).
+
+  Viewers get no download button and never receive cut words.
 - **Failure handling:**
   - A dropped connection pauses the upload and resumes it.
   - A server refusal shows up while you're still recording.
-  - **Download copy** saves the local recording whenever an upload fails.
+  - **Download copy** saves the local recording when an upload fails.
   - A recording interrupted by a closed tab can be **recovered** from the parts that already uploaded.
+  - Transcript chunks that never arrived show as gaps, not as a finished transcript.
 
 Links are public by unguessable id (12 characters, about 70 bits). Everything else needs the owner password.
+
+**What "cut" means:** edits are skipped during playback. They are not removed from the file. The full recording stays reachable at `/raw/<id>` (it has to be public to stream), and the cut ranges are in the page. Don't rely on a cut to hide something sensitive; re-record instead.
 
 ## Deploy
 
@@ -24,37 +35,53 @@ Deploys run only through GitHub Actions (`.github/workflows/deploy.yml`). The wo
 
 | Secret | Value |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | Account token: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit |
+| `CLOUDFLARE_API_TOKEN` | Account token: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit. If the deploy fails on the `AI` binding, add Workers AI Read. |
 | `CLOUDFLARE_ACCOUNT_ID` | Your account id |
 | `OWNER_PASSWORD` | The password you sign in with |
 
 Then push to `main`, or go to **Actions → Deploy → Run workflow**. Until the secrets exist, the workflow runs the tests and skips the deploy. `SESSION_SECRET` is generated on the first deploy. The app answers at `https://shuttle.<your-subdomain>.workers.dev`. To use a custom domain, add a `routes` entry to `wrangler.toml` (and give the token Zone Workers Routes Edit).
 
-Free-tier fit: R2 gives 10 GB free, about 6 hours of 1080p screen recording at the default 3.5 Mbps. Egress is free.
+**Costs and limits.**
+- R2 gives 10 GB free, about 6 hours of 1080p screen recording at 3.5 Mbps; the camera file adds about a third. Egress is free.
+- Transcripts use `@cf/openai/whisper-large-v3-turbo`, run twice per half-minute chunk. One run is prompted to keep "um"s and one is plain, and the plain one guards against the prompted one inventing text. That is a fraction of a cent per recorded minute.
+- Each chunk takes roughly 10 ms of Worker CPU. The Free plan's 10 ms limit can cut that off, which leaves a chunk *failed* (Retry on the share page). Workers Paid doesn't have the problem.
 
 ## Develop
 
 ```sh
 npm install
-echo 'OWNER_PASSWORD=dev' > .dev.vars
-npm run dev                      # migrations + wrangler dev on http://localhost:8787
+printf 'OWNER_PASSWORD=dev\n' > .dev.vars        # add OPENAI_API_KEY=… for local transcripts
+npm run dev                                       # migrations + wrangler dev --env local
 ```
 
-Safari keeps `Secure` cookies only over HTTPS, so test Safari through `wrangler dev --local-protocol https`.
+`--env local` has no Workers AI binding, so local runs never touch a Cloudflare account. Locally, transcripts come from OpenAI `whisper-1` if `OPENAI_API_KEY` is set. With no provider at all, the audio is kept and can be transcribed later. Safari keeps `Secure` cookies only over HTTPS, so test Safari through `wrangler dev --local-protocol https`.
 
 ## Tests
 
-- `npm test` runs the API contract (31 checks) against `wrangler dev` with local R2 and D1. It needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
-- `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, share page, play, seek, rename, thumbnail. Options are `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`, and `FAULT=flaky|fatal` for a dropped network or a refused upload. It needs Playwright (`PLAYWRIGHT_DIR`) and `BASE` pointing at a running dev server. WebKit gets synthetic camera and screen streams because Playwright can't grant camera permission on macOS.
+- `npm test` runs:
+  - the timeline maths (17 checks);
+  - the transcript post-processing (17);
+  - the API contract (36), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+- `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
+  - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
+  - `SURFACE=window` (a window share keeps the bubble)
+  - `FAULT=flaky|fatal` (dropped network, refused upload; `NOISE=1` for a high bitrate)
+  - `FAKE=1`: synthetic streams with a burnt-in time code, so camera/screen sync is checked frame by frame. WebKit always uses them, because Playwright can't grant camera permission on macOS.
+  - `OFFSET_MS=700` (camera recorder starts late), `CAM_END=1` (camera dies mid-recording)
+  - `SPEECH=1` (with a real transcriber): the fake mic speaks sentences. The run checks that transcript chunks sit where their audio is in the video, and that words line up with when they were said.
 
 ## Layout
 
 ```
-src/worker.js        API, auth, range-served video, thumbnails
+src/worker.js        API, auth, range-served video, thumbnails, transcript chunks
+src/transcribe.js    Whisper providers, picking the trustworthy result, snapping words to the audio
 src/share-page.js    server-rendered share page (Open Graph tags)
 public/app.js        library, setup sheet, recording flow
-public/recorder.js   capture, MediaRecorder, part uploader, thumbnail
-public/bubble.js     floating camera bubble (PiP)
-public/share.js      share-page player and owner controls
+public/recorder.js   capture, MediaRecorder ×2, part uploader, transcript tap, thumbnails
+public/pcm-tap.js    AudioWorklet: 16 kHz PCM for the transcript
+public/bubble.js     floating self-view (PiP)
+public/player.js     composite player: layouts, camera sync, cut skipping, captions
+public/share.js      share page: transcript, editing, owner controls
+public/timeline.js   cuts and words (shared by the browser and the Worker)
 migrations/          D1 schema
 ```
