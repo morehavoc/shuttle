@@ -69,7 +69,9 @@ function card(v) {
   const live = v.status === 'recording' && !interrupted;
   const link = `/v/${v.id}`;
   const shareUrl = location.origin + link;
-  const meta = [fmtAgo(v.createdAt), v.views ? `${v.views} view${v.views === 1 ? '' : 's'}` : null, fmtSize(v.size)].filter(Boolean).join(' · ');
+  const left = v.expiresAt ? Math.max(0, Math.ceil((v.expiresAt - Date.now()) / 864e5)) : null;
+  const meta = [fmtAgo(v.createdAt), v.views ? `${v.views} view${v.views === 1 ? '' : 's'}` : null, fmtSize(v.size),
+    left === null ? null : left <= 1 ? 'deletes tomorrow' : `deletes in ${left} days`].filter(Boolean).join(' · ');
   const el = h('article', { class: 'card' },
     h('a', { class: 'thumb', href: link },
       h('img', { src: `/thumb/${v.id}/og.jpg?v=${v.updatedAt || ''}`, alt: '', loading: 'lazy' }),
@@ -322,6 +324,7 @@ function onStart() {
     micStream: setup.micOn ? setup.micStream : null,
     audioCtx: tapCtx,
     layout: store.get('layout', null),
+    keepDays: store.get('keepDays', 30), // 'forever' or days; changed on any share page
   });
   // Both of these must start synchronously inside the click.
   const displayP = session.requestDisplay();

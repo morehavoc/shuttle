@@ -32,6 +32,10 @@ enabled = true
 
 # Local development, tests and the jaws-mini preview: `wrangler dev --env local`.
 # Same storage, no Workers AI (transcripts there use OPENAI_API_KEY from .dev.vars, or are off).
+# Hourly: delete videos past their expiry.
+[triggers]
+crons = ["23 * * * *"]
+
 [env.local]
 name = "shuttle-local"
 

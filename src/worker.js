@@ -8,6 +8,7 @@
 
 import { renderSharePage, renderNotFound } from './share-page.js';
 import { transcribeWav, provider } from './transcribe.js';
+import { draftDescription, describeProvider } from './describe.js';
 import { normalizeCuts, isWordCut } from '../public/timeline.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
@@ -35,7 +36,14 @@ export default {
       return json({ error: 'Something went wrong' }, 500);
     }
   },
+  // Hourly (wrangler.toml [triggers]): delete videos past their expiry.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sweepExpired(env));
+  },
 };
+
+const DAY = 86400000;
+const expired = (v) => !!(v && v.expires_at && v.expires_at <= Date.now());
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -71,7 +79,7 @@ async function route(request, env, ctx) {
   if (!(await isOwner(request, env))) throw new HttpError(401, 'Sign in');
   if (method !== 'GET' && method !== 'HEAD') checkSameOrigin(request, url);
 
-  if (path === '/api/videos' && method === 'GET') return listVideos(env);
+  if (path === '/api/videos' && method === 'GET') { ctx.waitUntil(sweepExpired(env)); return listVideos(env); }
   if (path === '/api/videos' && method === 'POST') return createVideo(request, env, url);
   if (match(new RegExp(`^/api/videos/${ID}$`))) {
     if (method === 'GET') return json(publicVideo(await getVideo(env, m[1]), url, true));
@@ -79,7 +87,8 @@ async function route(request, env, ctx) {
     if (method === 'DELETE') return deleteVideo(env, m[1]);
   }
   if (match(new RegExp(`^/api/videos/${ID}/parts/(\\d{1,5})$`)) && method === 'PUT') return uploadPart(request, env, m[1], Number(m[2]), url.searchParams.get('track') || 'main');
-  if (match(new RegExp(`^/api/videos/${ID}/complete$`)) && method === 'POST') return completeVideo(request, env, m[1], url);
+  if (match(new RegExp(`^/api/videos/${ID}/complete$`)) && method === 'POST') return completeVideo(request, env, ctx, m[1], url);
+  if (match(new RegExp(`^/api/videos/${ID}/describe$`)) && method === 'POST') return describeNow(env, m[1], url);
   if (match(new RegExp(`^/api/videos/${ID}/thumb$`)) && method === 'PUT') return putThumb(request, env, m[1], url.searchParams.get('variant') || 'poster');
   if (match(new RegExp(`^/api/videos/${ID}/audio/(\\d{1,5})$`)) && method === 'PUT') return putAudio(request, env, ctx, m[1], Number(m[2]));
   if (match(new RegExp(`^/api/videos/${ID}/transcript/retry$`)) && method === 'POST') return retryTranscript(env, m[1]);
@@ -169,11 +178,12 @@ async function createVideo(request, env, url) {
   }
   const layout = JSON.stringify(cleanLayout(body.layout) || DEFAULT_LAYOUT);
   const now = Date.now();
+  const keep = keepDays(body.keepDays, 1);
   await env.DB.prepare(
-    `INSERT INTO videos (id, title, mode, mime, status, upload_id, cam_mime, cam_upload_id, surface, layout, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO videos (id, title, mode, mime, status, upload_id, cam_mime, cam_upload_id, surface, layout, expires_at, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(id, title, mode, mime.split(';')[0], main.uploadId, camUploadId ? camMime.split(';')[0] : null, camUploadId,
-    cleanSurface(body.surface), layout, now, now).run();
+    cleanSurface(body.surface), layout, keep === null ? null : now + keep * DAY, now, now).run();
   return json({ id, title, partSize: PART_SIZE, shareUrl: `${url.origin}/v/${id}`, hasCam: !!camUploadId }, 201);
 }
 
@@ -226,7 +236,7 @@ async function completeTrack(env, id, track, uploadId) {
   }
 }
 
-async function completeVideo(request, env, id, url) {
+async function completeVideo(request, env, ctx, id, url) {
   const body = await readJson(request);
   const v = await getVideo(env, id);
   if (v.status === 'ready') return json(publicVideo(v, url, true));
@@ -250,6 +260,7 @@ async function completeVideo(request, env, id, url) {
       clampInt(body.tapGapMs, 0, 1e9), Date.now(), id),
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
   ]);
+  ctx.waitUntil(maybeDescribe(env, id)); // in case the transcript finished first
   return json({ ...publicVideo(await getVideo(env, id), url, true), truncated: main.truncated || !!(cam && cam.truncated) });
 }
 
@@ -278,6 +289,14 @@ async function patchVideo(request, env, id, url) {
     if (!l) throw new HttpError(400, 'Bad layout');
     sets.push('layout = ?'); args.push(JSON.stringify(l));
   }
+  if (body.description !== undefined) {
+    if (typeof body.description !== 'string') throw new HttpError(400, 'Bad description');
+    sets.push('description = ?', "description_source = 'owner'"); args.push(cleanDescription(body.description));
+  }
+  if (body.keepDays !== undefined) {
+    const k = keepDays(body.keepDays, 0);
+    sets.push('expires_at = ?'); args.push(k === null ? null : Date.now() + k * DAY);
+  }
   if (body.cuts !== undefined) {
     if (!Array.isArray(body.cuts) || body.cuts.length > 5000) throw new HttpError(400, 'Bad cuts');
     const dur = v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7;
@@ -291,7 +310,20 @@ async function patchVideo(request, env, id, url) {
 }
 
 async function deleteVideo(env, id) {
-  const v = await getVideo(env, id);
+  await removeVideo(env, await getVideo(env, id));
+  return json({ ok: true });
+}
+
+async function sweepExpired(env) {
+  try {
+    const { results } = await env.DB.prepare('SELECT * FROM videos WHERE expires_at IS NOT NULL AND expires_at <= ? LIMIT 50').bind(Date.now()).all();
+    for (const v of results) await removeVideo(env, v);
+    if (results.length) console.log(`expired: deleted ${results.length}`);
+  } catch (e) { console.error('sweep', e && e.message); }
+}
+
+async function removeVideo(env, v) {
+  const id = v.id;
   for (const [track, uploadId] of [['main', v.upload_id], ['cam', v.cam_upload_id]]) {
     if (v.status === 'recording' && uploadId) {
       try { await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId).abort(); } catch {}
@@ -306,7 +338,6 @@ async function deleteVideo(env, id) {
     env.DB.prepare('DELETE FROM transcript_chunks WHERE video_id = ?').bind(id),
     env.DB.prepare('DELETE FROM videos WHERE id = ?').bind(id),
   ]);
-  return json({ ok: true });
 }
 
 async function listVideos(env) {
@@ -315,8 +346,8 @@ async function listVideos(env) {
 }
 
 async function status(env, id) {
-  const v = await env.DB.prepare('SELECT status FROM videos WHERE id = ?').bind(id).first();
-  if (!v) throw new HttpError(404, 'Not found');
+  const v = await env.DB.prepare('SELECT status, expires_at FROM videos WHERE id = ?').bind(id).first();
+  if (!v || expired(v)) throw new HttpError(404, 'Not found');
   return json({ status: v.status });
 }
 
@@ -363,6 +394,7 @@ async function runChunk(env, id, seq) {
     await env.DB.prepare("UPDATE transcript_chunks SET status = 'ready', words = ?, error = NULL, updated_at = ? WHERE video_id = ? AND seq = ?")
       .bind(JSON.stringify(abs), Date.now(), id, seq).run();
     await env.VIDEOS.delete(audioKey(id, seq));
+    await maybeDescribe(env, id);
   } catch (e) {
     console.error('transcribe', id, seq, e && e.message);
     await env.DB.prepare("UPDATE transcript_chunks SET status = 'failed', error = ?, updated_at = ? WHERE video_id = ? AND seq = ?")
@@ -388,8 +420,8 @@ async function transcriptOf(env, id, expected = -1) {
 }
 
 async function getTranscript(request, env, id) {
-  const v = await env.DB.prepare('SELECT status, cuts, audio_chunks FROM videos WHERE id = ?').bind(id).first();
-  if (!v) throw new HttpError(404, 'Not found');
+  const v = await env.DB.prepare('SELECT status, cuts, audio_chunks, expires_at FROM videos WHERE id = ?').bind(id).first();
+  if (!v || expired(v)) throw new HttpError(404, 'Not found');
   const t = await transcriptOf(env, id, v.status === 'ready' ? v.audio_chunks : -1);
   if (!(await isOwner(request, env))) {
     // Viewers never get the words that were cut.
@@ -417,18 +449,62 @@ async function retryTranscript(env, id) {
 
 // ---------- public reads ----------
 
+// ---------- description ----------
+
+// Drafts a description (and replaces the default title) once the transcript is done — only if
+// the owner hasn't written one. Claims the row first so two chunks finishing together draft once.
+async function maybeDescribe(env, id) {
+  try {
+    if (!describeProvider(env)) return;
+    const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
+    if (!v || v.status !== 'ready' || v.description_source !== '') return;
+    const t = await transcriptOf(env, id, v.audio_chunks);
+    if (t.status === 'pending' || t.status === 'none' || t.status === 'off') return;
+    const words = t.words.filter((w) => !isWordCut(w, parseJson(v.cuts, [])));
+    if (words.length < 8) return;
+    const claimed = await env.DB.prepare("UPDATE videos SET description_source = 'working' WHERE id = ? AND description_source = ''").bind(id).run();
+    if (!claimed.meta || !claimed.meta.changes) return;
+    try {
+      await applyDraft(env, v, await draftDescription(env, words));
+    } catch (e) {
+      console.error('describe', id, e && e.message);
+      await env.DB.prepare("UPDATE videos SET description_source = '' WHERE id = ? AND description_source = 'working'").bind(id).run();
+    }
+  } catch (e) { console.error('maybeDescribe', e && e.message); }
+}
+
+async function applyDraft(env, v, d) {
+  const title = d.title && isDefaultTitle(v.title) ? cleanTitle(d.title) : null;
+  await env.DB.prepare(
+    "UPDATE videos SET description = ?, description_source = 'auto', title = COALESCE(?, title), updated_at = ? WHERE id = ? AND description_source != 'owner'"
+  ).bind(cleanDescription(d.description), title, Date.now(), v.id).run();
+}
+
+// Owner's "Write one for me": always redraws the description (the title only if still default).
+async function describeNow(env, id, url) {
+  const v = await getVideo(env, id);
+  if (!describeProvider(env)) throw new HttpError(409, 'Descriptions aren’t set up on this server');
+  const t = await transcriptOf(env, id, v.audio_chunks);
+  const words = t.words.filter((w) => !isWordCut(w, parseJson(v.cuts, [])));
+  if (words.length < 3) throw new HttpError(409, 'Not enough transcript to go on yet');
+  const d = await draftDescription(env, words);
+  await env.DB.prepare("UPDATE videos SET description_source = 'auto' WHERE id = ?").bind(id).run();
+  await applyDraft(env, { ...v, description_source: 'auto' }, d);
+  return json(publicVideo(await getVideo(env, id), url, true));
+}
+
 async function sharePage(request, env, id) {
   const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
   const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() };
-  if (!v) return new Response(renderNotFound(), { status: 404, headers });
+  if (!v || expired(v)) return new Response(renderNotFound(), { status: 404, headers });
   const url = new URL(request.url);
   const owner = await isOwner(request, env);
   return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
 }
 
 async function rawVideo(request, env, id, track, url) {
-  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout FROM videos WHERE id = ?').bind(id).first();
-  if (!v || v.status !== 'ready') return new Response('Not found', { status: 404 });
+  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at FROM videos WHERE id = ?').bind(id).first();
+  if (!v || v.status !== 'ready' || expired(v)) return new Response('Not found', { status: 404 });
   const download = [...url.searchParams.keys()].some((k) => k.toLowerCase() === 'download');
   if (download && !(await isOwner(request, env))) return new Response('Downloads are for the owner', { status: 403 });
   // With the Screen layout the camera isn't part of the video, so viewers can't fetch it.
@@ -473,8 +549,9 @@ async function rawVideo(request, env, id, track, url) {
 }
 
 async function thumb(request, env, id, variant) {
+  const v = await env.DB.prepare('SELECT layout, expires_at FROM videos WHERE id = ?').bind(id).first();
+  if (expired(v)) return new Response('Not found', { status: 404 });
   if (variant !== 'poster') {
-    const v = await env.DB.prepare('SELECT layout FROM videos WHERE id = ?').bind(id).first();
     if (v && camHidden(v)) {
       if (variant === 'cam' && !(await isOwner(request, env))) return new Response('Not found', { status: 404 });
       if (variant === 'og') variant = 'poster'; // the preview without his face
@@ -510,7 +587,7 @@ export function parseRange(header, size) {
 
 async function getVideo(env, id) {
   const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
-  if (!v) throw new HttpError(404, 'Not found');
+  if (!v || expired(v)) throw new HttpError(404, 'Not found');
   return v;
 }
 
@@ -528,6 +605,7 @@ function publicVideo(v, url, owner = false) {
     hasCam: !!(v.cam_mime && (v.cam_size || v.cam_upload_id)), camMime: v.cam_mime || null, camOffsetMs: v.cam_offset_ms || 0,
     layout: parseJson(v.layout, null) || (v.cam_mime ? DEFAULT_LAYOUT : { kind: 'screen', corner: 'bl', size: 'm' }),
     cuts: parseJson(v.cuts, []),
+    description: v.description || '',
     createdAt: v.created_at,
   };
   if (!owner && v.cam_mime && camHidden(v)) Object.assign(out, { hasCam: false, hasCamThumb: false, camMime: null });
@@ -535,6 +613,7 @@ function publicVideo(v, url, owner = false) {
     Object.assign(out, {
       size: v.size, camSize: v.cam_size || 0, views: v.views, updatedAt: v.updated_at,
       surface: v.surface || '', camMutedMs: v.cam_muted_ms || 0, tapGapMs: v.tap_gap_ms || 0,
+      expiresAt: v.expires_at || null, descriptionSource: v.description_source || '',
     });
   }
   if (url) out.shareUrl = `${url.origin}/v/${v.id}`;
@@ -564,6 +643,18 @@ function newId(n) {
 
 function cleanTitle(t) {
   return typeof t === 'string' ? t.replace(/\s+/g, ' ').trim().slice(0, 140) : '';
+}
+
+function isDefaultTitle(t) { return /^Recording · /.test(String(t || '')); }
+
+function cleanDescription(d) { return String(d || '').replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 1000); }
+
+// null = keep forever; else whole days within [min, 3650].
+function keepDays(x, min) {
+  if (x === null || x === undefined || x === 'forever') return null;
+  const n = Number(x);
+  if (!Number.isFinite(n)) throw new HttpError(400, 'Bad keepDays');
+  return Math.max(min, Math.min(3650, Math.round(n)));
 }
 
 function defaultTitle(tz) {

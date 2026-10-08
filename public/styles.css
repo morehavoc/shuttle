@@ -1,34 +1,25 @@
 :root {
-  --bg: #f6f5f2;
+  /* christophermoravec.com (AEH) tokens: warm paper, white cards, muted teal. */
+  --bg: #fcfaf6;
   --bg-2: #ffffff;
   --panel: #ffffff;
-  --line: #e6e2da;
-  --text: #1a1916;
-  --muted: #6f6a61;
-  --accent: #ea580c;
-  --accent-2: #f97316;
+  --line: #e7e1d6;
+  --text: #1f2328;
+  --muted: #6b6456;
+  --accent: #2a6f8c;
+  --accent-2: #185987;
+  --accent-soft: #dfeaf0;
+  --accent-line: #a9c6d4;
   --accent-ink: #ffffff;
-  --danger: #dc2626;
-  --rec: #ef4444;
-  --shadow: 0 1px 2px rgba(26, 25, 22, .06), 0 8px 24px rgba(26, 25, 22, .08);
-  --shadow-lg: 0 20px 60px rgba(26, 25, 22, .22);
+  --danger: #b42318;
+  --rec: #e5383b;
+  --shadow: 0 1px 2px rgba(30, 60, 80, .06), 0 8px 24px rgba(30, 60, 80, .08);
+  --shadow-lg: 0 20px 60px rgba(30, 60, 80, .22);
   --radius: 14px;
-  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", Roboto, sans-serif;
-  color-scheme: light dark;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #111214;
-    --bg-2: #17181b;
-    --panel: #1b1c20;
-    --line: #2a2c31;
-    --text: #f3f1ec;
-    --muted: #9c988f;
-    --accent: #fb7a2e;
-    --accent-2: #ff9a5c;
-    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
-    --shadow-lg: 0 20px 60px rgba(0, 0, 0, .55);
-  }
+  --font: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --display: "Fira Sans", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", Menlo, Consolas, monospace;
+  color-scheme: light;
 }
 
 * { box-sizing: border-box; }
@@ -305,7 +296,7 @@ a { color: inherit; }
 .sp-bg {
   position: absolute; inset: 0; opacity: 0; transition: opacity .35s ease;
   background:
-    radial-gradient(110% 90% at 0% 0%, rgba(234, 88, 12, .28) 0%, transparent 55%),
+    radial-gradient(110% 90% at 0% 0%, rgba(42, 111, 140, .30) 0%, transparent 55%),
     radial-gradient(110% 100% at 100% 100%, rgba(251, 191, 36, .14) 0%, transparent 55%),
     linear-gradient(135deg, #1c1714, #0f0f12);
 }
@@ -411,3 +402,14 @@ a { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Brand type: Fira Sans for headings and the name, mono for times. */
+h1, h2, .title, .brand, .who, .sheet-head h2, .stage-title { font-family: var(--display); }
+.tc-ts, .sp-time, .dur, .recbar .time, .when { font-family: var(--mono); font-feature-settings: "tnum"; }
+
+.description { margin: 6px 0 0; max-width: 70ch; color: var(--muted); font-size: 16px; line-height: 1.5; white-space: pre-wrap; border-radius: 8px; padding: 2px 6px; margin-left: -6px; outline: none; }
+.description[contenteditable]:empty::before { content: attr(data-placeholder); color: color-mix(in srgb, var(--muted) 60%, transparent); }
+.description[contenteditable]:hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+.description[contenteditable]:focus { background: var(--panel); box-shadow: 0 0 0 2px var(--accent); color: var(--text); }
+.desc-write { font-size: 13px; margin-top: 6px; }
+.row-note { font-size: 13px; color: var(--muted); }

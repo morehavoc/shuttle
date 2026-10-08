@@ -307,13 +307,14 @@ class AudioTap {
 // ---------- one recording session ----------
 
 export class Session extends EventTarget {
-  constructor({ mode, cameraStream, micStream, audioCtx, layout }) {
+  constructor({ mode, cameraStream, micStream, audioCtx, layout, keepDays }) {
     super();
     this.mode = mode;
     this.cameraStream = cameraStream || null;
     this.micStream = micStream || null;
     this.audioCtx = audioCtx || null; // created inside the click, for the transcript tap
     this.layout = layout || null;
+    this.keepDays = keepDays === undefined ? 'forever' : keepDays;
     this.displayStream = null;
     this.surface = mode === 'camera' ? 'camera' : '';
     this.chunks = { main: [], cam: [] };
@@ -344,8 +345,13 @@ export class Session extends EventTarget {
         try { v.contentHint = 'detail'; } catch {}
         const set = v.getSettings ? v.getSettings() : {};
         this.surface = set.displaySurface || '';
-        // The browser's own "Stop sharing" button ends the track.
-        v.addEventListener('ended', () => this.emit('display-ended'));
+        // The browser's own "Stop sharing" control ends the track. Safari doesn't always fire
+        // 'ended' for it, so the track's state is also checked every second.
+        let told = false;
+        const ended = () => { if (told) return; told = true; clearInterval(this.endedPoll); this.emit('display-ended'); };
+        v.addEventListener('ended', ended);
+        s.addEventListener && s.addEventListener('inactive', ended);
+        this.endedPoll = setInterval(() => { if (v.readyState === 'ended') ended(); }, 1000);
       }
       return s;
     });
@@ -362,6 +368,7 @@ export class Session extends EventTarget {
         mode: this.mode,
         surface: this.surface,
         layout: this.layout,
+        keepDays: this.keepDays,
         tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
       },
     });
@@ -494,7 +501,8 @@ export class Session extends EventTarget {
     this.state = 'stopping';
     this.emit('state');
     for (const r of Object.values(this.recorders)) { try { r.stop(); } catch {} }
-    await Promise.all(Object.values(this.recorders).map((r) => r.stoppedP));
+    // A recorder that never reports stopping mustn't hold up the rest (its data is in already).
+    await Promise.all(Object.values(this.recorders).map((r) => Promise.race([r.stoppedP, new Promise((ok) => setTimeout(ok, 5000))])));
     this.releaseCapture();
     try {
       return await this.finalize();
@@ -568,7 +576,10 @@ export class Session extends EventTarget {
   }
 
   releaseCapture() {
+    clearInterval(this.endedPoll);
     if (this.displayStream) this.displayStream.getTracks().forEach((t) => t.stop());
+    // The camera too, so its light (and the bubble) show at once that recording stopped.
+    if (this.cameraStream) this.cameraStream.getTracks().forEach((t) => t.stop());
     if (this.mixer) this.mixer.close();
   }
 

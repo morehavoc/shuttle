@@ -76,6 +76,57 @@ if (owner) {
   });
 }
 
+// ---------- description ----------
+const descEl = $('#description');
+function showDescription(text) {
+  if (document.activeElement === descEl) return;
+  descEl.textContent = text || '';
+  descEl.hidden = !owner && !text;
+}
+if (owner) {
+  descEl.hidden = false;
+  descEl.contentEditable = 'plaintext-only';
+  if (descEl.contentEditable !== 'plaintext-only') descEl.contentEditable = 'true';
+  descEl.dataset.placeholder = 'Add a description';
+  descEl.spellcheck = true;
+  let before = descEl.textContent;
+  descEl.addEventListener('focus', () => { before = descEl.textContent; });
+  descEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); descEl.blur(); }
+    if (e.key === 'Escape') { descEl.textContent = before; descEl.blur(); }
+  });
+  descEl.addEventListener('blur', async () => {
+    const next = descEl.innerText.replace(/[ \t]+/g, ' ').trim();
+    if (next === before.trim()) return;
+    try {
+      const out = await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { description: next } });
+      v.description = out.description;
+      descEl.textContent = out.description;
+      toast('Saved');
+    } catch (e) { descEl.textContent = before; toast(e.message, { bad: true }); }
+  });
+  const write = h('button', { class: 'linkish desc-write', type: 'button', onclick: async () => {
+    write.disabled = true; write.textContent = 'Writing…';
+    try {
+      const out = await api(`/api/videos/${v.id}/describe`, { method: 'POST' });
+      applyVideo(out);
+    } catch (e) { toast(e.message, { bad: true }); }
+    write.disabled = false; write.textContent = 'Write one for me';
+  } }, 'Write one for me');
+  write.hidden = v.status !== 'ready';
+  descEl.after(write);
+}
+
+// New title / description from the server (the auto draft lands after the transcript).
+function applyVideo(out) {
+  if (out.title && document.activeElement !== $('#title')) {
+    $('#title').textContent = out.title;
+    document.title = `${out.title}${ownerName ? ` · ${ownerName}` : ''}`;
+  }
+  v.description = out.description || '';
+  showDescription(v.description);
+}
+
 if (params.has('new')) {
   if (params.has('copied')) toast('Link copied');
   else copyBtn.focus();
@@ -123,7 +174,30 @@ function ownerPanel() {
     sync();
     parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
   }
+  parts.push(keepRow());
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
+}
+
+const KEEP = [{ d: 7, label: '7 days' }, { d: 30, label: '30 days' }, { d: 90, label: '90 days' }, { d: 'forever', label: 'Forever' }];
+function keepRow() {
+  const note = h('span', { class: 'row-note' });
+  const seg = h('div', { class: 'seg seg-inline', role: 'group', 'aria-label': 'Keep for' },
+    ...KEEP.map((k) => h('button', { type: 'button', 'data-keep': String(k.d), onclick: () => save(k.d) }, k.label)));
+  const sync = () => {
+    note.textContent = v.expiresAt ? `Deletes ${new Date(v.expiresAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}` : 'Kept until you delete it';
+    const days = v.expiresAt ? Math.round((v.expiresAt - Date.now()) / 864e5) : 'forever';
+    seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.keep === String(days))));
+  };
+  async function save(d) {
+    try {
+      const out = await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { keepDays: d } });
+      v.expiresAt = out.expiresAt;
+      localStorage.setItem('shuttle.keepDays', JSON.stringify(d)); // the next recording starts here
+      sync();
+    } catch (e) { toast(e.message, { bad: true }); }
+  }
+  sync();
+  return h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Keep'), seg, note);
 }
 
 // ---------- transcript ----------
@@ -151,6 +225,7 @@ async function loadTranscript() {
   words = t.words || [];
   player.setWords(words);
   renderTranscript(t);
+  if (owner && !v.description && (v.descriptionSource === '' || v.descriptionSource === 'working')) watchForDraft();
 }
 
 function renderTranscriptShell(state) {
@@ -202,6 +277,16 @@ function renderWords() {
     return p;
   }));
   body.classList.toggle('editing', editing);
+}
+
+// The description is drafted a few seconds after the last transcript chunk; pick it up.
+async function watchForDraft() {
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 2500));
+    let out;
+    try { out = await api(`/api/videos/${v.id}`); } catch { return; }
+    if (out.description || out.descriptionSource === 'owner') { applyVideo(out); return; }
+  }
 }
 
 // Click a word to jump there (outside edit selections).

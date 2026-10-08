@@ -7,6 +7,8 @@
 //   FAKE=1          → synthetic streams in Chromium too (WebKit always uses them). They carry a
 //                     time code, so camera/screen sync is checked frame by frame.
 //   OFFSET_MS=700   → start the camera recorder late; the player must still line it up
+//   STOP=share      → end the screen share from "the browser" (track stopped, no 'ended' event,
+//                     like Safari's own Stop sharing); one stop must finish the recording
 //   CAM_END=1       → the camera stops mid-recording; the player must hold its last frame
 //   SPEECH=1        → the fake mic speaks a sentence every 4 s; with a server using a real
 //                     transcriber (TRANSCRIBE=real sh test/serve.sh) checks the words' timing
@@ -142,6 +144,7 @@ async function newContext() {
       def('getDisplayMedia', async () => {
         const s = fakeVideo(1920, 1080, 'SCREEN');
         const t = s.getVideoTracks()[0];
+        window.__screenTrack = t;
         if (surface) { const orig = t.getSettings.bind(t); t.getSettings = () => ({ ...orig(), displaySurface: surface }); }
         return s;
       });
@@ -278,8 +281,10 @@ try {
     throw Object.assign(new Error('done'), { expected: true });
   }
 
-  await page.click('.recbar .stop');
+  if (process.env.STOP === 'share') await page.evaluate(() => window.__screenTrack.stop());
+  else await page.click('.recbar .stop');
   await page.waitForURL(/\/v\/[A-Za-z0-9]+/, { timeout: 60000 });
+  if (process.env.STOP === 'share') ok('stopping the share from the browser finished the recording');
   const shareUrl = page.url().split('?')[0];
   ok(`stopped at ${shownTime}, landed on ${shareUrl}`);
   await page.waitForSelector('.sp', { timeout: 30000 });
@@ -357,6 +362,22 @@ try {
     await page.evaluate(() => document.querySelector('.sp-main').pause());
     const notice = await page.evaluate(() => document.querySelector('#owner-panel').textContent);
     check(/camera stopped/i.test(notice), 'owner told the camera stopped', `no camera notice: ${notice}`);
+  }
+
+  // ---------- description + keep ----------
+  if (!SPEECH) {
+    await page.waitForFunction(() => document.querySelector('#description').textContent.trim().length > 5, null, { timeout: 30000 });
+    const d = await page.evaluate(() => ({ text: document.querySelector('#description').textContent, title: document.querySelector('#title').textContent, keep: !!document.querySelector('[data-keep="30"][aria-pressed="true"]') }));
+    check(d.title === 'Quick Shuttle test', `description drafted (${d.text.slice(0, 40)}…) and default title replaced`, `draft: ${JSON.stringify(d)}`);
+    check(d.keep, 'keeps 30 days by default', 'keep default not 30 days');
+    await page.click('#description');
+    await page.keyboard.press('Meta+A');
+    await page.keyboard.type('For Holly: the new intake form.');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(600);
+    const saved = await page.evaluate((id) => fetch(`/api/videos/${id}`).then((r) => r.json()), meta.id);
+    check(saved.description === 'For Holly: the new intake form.', 'description edited in place', `saved: ${saved.description}`);
+    await shot('6b-description.png');
   }
 
   // ---------- layouts ----------

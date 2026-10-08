@@ -8,7 +8,7 @@ export function renderSharePage(v, { owner, origin, ownerName }) {
   const ogImage = `${origin}/thumb/${v.id}/og.jpg?l=${v.layout && v.layout.kind === 'screen' ? 's' : 'c'}`;
   const ready = v.status === 'ready';
   const dur = v.durationMs ? fmtDuration(v.durationMs) : '';
-  const desc = [ownerName, dur].filter(Boolean).join(' · ');
+  const desc = v.description ? v.description.slice(0, 200) : [ownerName, dur].filter(Boolean).join(' · ');
   const data = JSON.stringify({ video: v, owner, ownerName }).replace(/</g, '\\u003c');
   const avatar = v.hasCamThumb && v.hasCam ? `/thumb/${v.id}/cam.jpg` : '';
   return `<!doctype html>
@@ -18,7 +18,7 @@ export function renderSharePage(v, { owner, origin, ownerName }) {
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>${esc(v.title)}${ownerName ? ` · ${esc(ownerName)}` : ''}</title>
 <meta name="robots" content="noindex">
-<meta name="theme-color" content="#111214">
+<meta name="theme-color" content="#fcfaf6">
 <meta name="description" content="${esc(desc)}">
 <meta property="og:type" content="video.other">
 <meta property="og:title" content="${esc(v.title)}">
@@ -32,6 +32,7 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${esc(v.title)}">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.bunny.net"><link rel="stylesheet" href="https://fonts.bunny.net/css?family=fira-sans:500,600,700|noto-sans:400,700|jetbrains-mono:400,500&display=swap">
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body class="share">
@@ -49,6 +50,7 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
       </div>
     </div>
     <h1 id="title" class="title">${esc(v.title)}</h1>
+    <p id="description" class="description"${v.description ? '' : ' hidden'}>${esc(v.description)}</p>
   </section>
   <div class="player-host" id="player-host">
     ${ready ? '' : `<div class="player-pending" id="pending"><div class="spinner"></div><p>Finishing upload…</p></div>`}

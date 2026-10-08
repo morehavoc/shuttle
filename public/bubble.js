@@ -26,7 +26,7 @@ button.stop{background:#ff4438;color:#fff;width:auto;padding:0 10px;gap:5px;disp
 button.stop svg{width:11px;height:11px}
 .cd{position:absolute;inset:0;display:grid;place-items:center;background:rgba(10,10,12,.45);font-size:72px;font-weight:800;text-shadow:0 6px 30px rgba(0,0,0,.6)}
 .done{position:absolute;inset:0;display:grid;place-items:center;align-content:center;gap:10px;background:#111214;text-align:center;padding:12px;font-size:14px}
-.done button{width:auto;height:34px;padding:0 14px;background:#ff6b2c;color:#fff;font-weight:700;border-radius:10px;font-size:13px}
+.done button{width:auto;height:34px;padding:0 14px;background:#2a6f8c;color:#fff;font-weight:700;border-radius:10px;font-size:13px}
 .done .muted{color:#9c988f;font-size:12.5px}
 @keyframes p{50%{opacity:.35}}
 `;
@@ -181,7 +181,9 @@ export class Bubble extends EventTarget {
 
   // After Stop: the bubble turns into "Link copied / Copy link".
   showDone(shareUrl, { copied, onCopy }) {
-    if (!this.win) return;
+    // Safari's bubble is a plain video window that can't show anything else: close it, or it
+    // keeps showing the live camera and looks like it's still recording.
+    if (!this.win) { this.close(); return; }
     const d = this.win.document;
     const box = d.createElement('div');
     box.className = 'done';

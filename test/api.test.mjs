@@ -351,6 +351,56 @@ try {
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
+  await test('description: drafted from the transcript (default title replaced), owner edits win', async () => {
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', keepDays: 30 } }));
+    assert.ok(c.title.startsWith('Recording · '));
+    await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 1000)) });
+    await call(`/api/videos/${c.id}/audio/0`, { method: 'PUT', body: wav(6), headers: { 'X-Start-Ms': '0', 'X-Duration-Ms': '6000' } });
+    await j(await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { audioChunks: 1 } }));
+    let v;
+    for (let i = 0; i < 40; i++) {
+      v = await j(await call(`/api/videos/${c.id}`));
+      if (v.description) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(v.description.length > 10, `description: ${v.description}`);
+    assert.equal(v.title, 'Quick Shuttle test');
+    assert.equal(v.descriptionSource, 'auto');
+    const exp = v.expiresAt - Date.now();
+    assert.ok(exp > 29.9 * 864e5 && exp <= 30 * 864e5, `expires in ${exp}`);
+    let r = await j(await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { description: '  Mine,\n\n\n  please. ' } }));
+    assert.equal(r.description, 'Mine,\n\n please.');
+    assert.equal(r.descriptionSource, 'owner');
+    const html = await (await call(`/v/${c.id}`, { anon: true })).text();
+    assert.match(html, /<meta property="og:description" content="Mine,/);
+    assert.match(html, /id="description"[^>]*>Mine,/);
+    assert.doesNotMatch(html, /"descriptionSource"|"expiresAt"/);
+    r = await j(await call(`/api/videos/${c.id}/describe`, { method: 'POST' }));
+    assert.equal(r.descriptionSource, 'auto', 'Write one for me redraws on request');
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
+  });
+
+  await test('expiry: keep forever, or expire — expired videos vanish and get swept', async () => {
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
+    await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 1000)) });
+    await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: {} });
+    assert.equal((await j(await call(`/api/videos/${c.id}`))).expiresAt, null, 'no keepDays = forever');
+    let r = await j(await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { keepDays: 7 } }));
+    assert.ok(r.expiresAt > Date.now() + 6.9 * 864e5);
+    r = await j(await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { keepDays: 'forever' } }));
+    assert.equal(r.expiresAt, null);
+    assert.equal((await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { keepDays: 'soon' } })).status, 400);
+    await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { keepDays: 0 } }); // expires now
+    assert.equal((await call(`/v/${c.id}`, { anon: true })).status, 404);
+    assert.equal((await call(`/raw/${c.id}`, { anon: true })).status, 404);
+    assert.equal((await call(`/thumb/${c.id}/og.jpg`, { anon: true })).status, 404);
+    assert.equal((await call(`/api/videos/${c.id}`)).status, 404);
+    await call('/api/videos'); // listing sweeps
+    await new Promise((res) => setTimeout(res, 500));
+    const list = await j(await call('/api/videos'));
+    assert.ok(!list.videos.some((x) => x.id === c.id));
+  });
+
   await test('camera track with no data is dropped at complete', async () => {
     const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', camMime: 'video/mp4', mode: 'screen-camera' } }));
     assert.equal(c.hasCam, true);
