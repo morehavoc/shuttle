@@ -422,34 +422,7 @@ export class Player extends EventTarget {
     const mw = m.videoWidth || this.v.width || 16, mh = m.videoHeight || this.v.height || 9;
     const ar = mw / mh;
     const kind = this.hasCam ? this.layout.kind : 'screen';
-    const unit = Math.min(W, H * 16 / 9) / 1000;
-    let main, cam = null;
-
-    if (this.v.mode === 'camera') {
-      main = { x: 0, y: 0, w: W, h: H, r: 0 };
-    } else if (kind === 'side') {
-      const pad = W * 0.04;
-      const camW = W * 0.25;
-      const region = { x: pad, y: pad, w: W - camW - pad * 3, h: H - pad * 2 };
-      main = { ...fit(ar, region), r: 12 * unit };
-      const camH = Math.min(H - pad * 2, camW * 1.32);
-      cam = { x: W - pad - camW, y: (H - camH) / 2, w: camW, h: camH, r: 16 * unit, shape: 'card' };
-    } else {
-      main = { ...fit(ar, { x: 0, y: 0, w: W, h: H }), r: 0 };
-      if (kind === 'bubble' || kind === 'card') {
-        const margin = Math.max(10, H * 0.04);
-        let w, hh;
-        if (kind === 'bubble') { w = hh = Math.min(H * BUBBLE[this.layout.size] || H * BUBBLE.m, main.w * 0.45); }
-        else { w = Math.min(W * (CARD[this.layout.size] || CARD.m), main.w * 0.4); hh = w * 1.25; }
-        const left = this.layout.corner.endsWith('l');
-        const top = this.layout.corner.startsWith('t');
-        cam = {
-          x: left ? main.x + margin : main.x + main.w - margin - w,
-          y: top ? main.y + margin : main.y + main.h - margin - hh,
-          w, h: hh, r: kind === 'bubble' ? w / 2 : 16 * unit, shape: kind, bottom: !top,
-        };
-      }
-    }
+    const { main, cam, unit } = layoutBoxes({ W, H, ar, kind, layout: this.layout, cameraMode: this.v.mode === 'camera' });
 
     place(this.mainWrap, main);
     this.updateCamHidden();
@@ -465,6 +438,39 @@ export class Player extends EventTarget {
     }
     this.el.style.setProperty('--unit', String(unit));
   }
+}
+
+// Where the screen and the camera go in a W×H frame. Shared by the player and the export, so a
+// downloaded video looks like the share page.
+export function layoutBoxes({ W, H, ar, kind, layout, cameraMode }) {
+  const unit = Math.min(W, H * 16 / 9) / 1000;
+  let main, cam = null;
+  if (cameraMode) {
+    main = { x: 0, y: 0, w: W, h: H, r: 0 };
+  } else if (kind === 'side') {
+    const pad = W * 0.04;
+    const camW = W * 0.25;
+    const region = { x: pad, y: pad, w: W - camW - pad * 3, h: H - pad * 2 };
+    main = { ...fit(ar, region), r: 12 * unit };
+    const camH = Math.min(H - pad * 2, camW * 1.32);
+    cam = { x: W - pad - camW, y: (H - camH) / 2, w: camW, h: camH, r: 16 * unit, shape: 'card' };
+  } else {
+    main = { ...fit(ar, { x: 0, y: 0, w: W, h: H }), r: 0 };
+    if (kind === 'bubble' || kind === 'card') {
+      const margin = Math.max(10, H * 0.04);
+      let w, hh;
+      if (kind === 'bubble') { w = hh = Math.min(H * BUBBLE[layout.size] || H * BUBBLE.m, main.w * 0.45); }
+      else { w = Math.min(W * (CARD[layout.size] || CARD.m), main.w * 0.4); hh = w * 1.25; }
+      const left = layout.corner.endsWith('l');
+      const top = layout.corner.startsWith('t');
+      cam = {
+        x: left ? main.x + margin : main.x + main.w - margin - w,
+        y: top ? main.y + margin : main.y + main.h - margin - hh,
+        w, h: hh, r: kind === 'bubble' ? w / 2 : 16 * unit, shape: kind, bottom: !top,
+      };
+    }
+  }
+  return { main, cam, unit };
 }
 
 function fit(ar, box) {

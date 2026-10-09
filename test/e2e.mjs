@@ -521,6 +521,30 @@ try {
   await page.evaluate(() => document.querySelector('.sp-main').pause());
   } // !SPEECH
 
+  // ---------- export: one file, camera burnt in ----------
+  if (!SPEECH && (MODE === 'screen-camera' || (await page.evaluate(() => (window.__SHUTTLE__.video.cuts || []).length)) || true)) {
+    const expected = await page.evaluate(() => {
+      const t = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number);
+      return t[0] * 60 + t[1];
+    });
+    await page.click('.share-actions .btn:has-text("Download")');
+    const item = MODE === 'screen-camera' ? 'Screen and camera together' : 'With your edits';
+    const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 120000 }), page.click(`.menu a:has-text("${item}")`)]);
+    const f = path.join(out, `export-${dl.suggestedFilename()}`);
+    await dl.saveAs(f);
+    const probe = JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height:format=duration', '-of', 'json', f]).toString());
+    const types = probe.streams.map((x) => x.codec_type).sort().join(',');
+    const dur = Number(probe.format.duration);
+    console.log(`       export: ${dl.suggestedFilename()} ${types} ${probe.streams.find((x) => x.width)?.width}x${probe.streams.find((x) => x.height)?.height} ${dur.toFixed(1)} s (page says ${expected} s)`);
+    check(types === 'audio,video' && Math.abs(dur - expected) < 1.6, `"${item}" downloads one file with sound at the edited length`, `export: ${types} ${dur} s vs ${expected} s`);
+    if (MODE === 'screen-camera' && FAKE_MEDIA) {
+      // The card sits bottom-right (set above): its pixels must be the camera, not the screen.
+      const frame = path.join(out, 'export-frame.png');
+      execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-ss', String(Math.max(1, dur / 2)), '-i', f, '-frames:v', '1', frame]);
+      ok(`export frame saved (${path.basename(frame)})`);
+    }
+  }
+
   // ---------- what a viewer sees ----------
   const vctx = await newContext();
   const vpage = await vctx.newPage();

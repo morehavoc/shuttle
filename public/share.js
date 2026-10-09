@@ -38,8 +38,10 @@ if (owner) {
   if (v.status === 'ready') {
     const dl = h('div', { class: 'menu-wrap' });
     const menu = h('div', { class: 'menu', hidden: true },
+      v.hasCam ? h('a', { href: '#', onclick: (e) => { e.preventDefault(); menu.hidden = true; exportTogether(); } }, 'Screen and camera together') : null,
       h('a', { href: `/raw/${v.id}?download=1` }, v.hasCam ? 'Screen and audio' : 'Video'),
-      v.hasCam ? h('a', { href: `/raw/${v.id}/cam?download=1` }, 'Camera') : null);
+      v.hasCam ? h('a', { href: `/raw/${v.id}/cam?download=1` }, 'Camera only (no sound)') : null,
+      !v.hasCam ? h('a', { href: '#', onclick: (e) => { e.preventDefault(); menu.hidden = true; exportTogether(); } }, 'With your edits') : null);
     const btn = h('button', { class: 'btn', type: 'button', html: `${icon.download}Download`, onclick: (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; } });
     document.addEventListener('click', () => { menu.hidden = true; });
     dl.append(btn, menu);
@@ -125,6 +127,35 @@ function applyVideo(out) {
   }
   v.description = out.description || '';
   showDescription(v.description);
+}
+
+// One file with the camera over the screen, as the page shows it (layout, edits), made by
+// playing the video through once here.
+async function exportTogether() {
+  const { exportComposite } = await import('./export.js');
+  const ctrl = new AbortController();
+  const bar = h('div', { class: 'progress' }, h('i'));
+  const label = h('div', { style: 'font-weight:600' }, 'Making your video… 0%');
+  const box = h('div', { class: 'finishing', role: 'alertdialog', 'aria-label': 'Making your video' },
+    h('div', { class: 'box' }, label, bar,
+      h('div', { class: 'muted', style: 'font-size:13px;max-width:320px' }, 'It plays through once, so this takes as long as the video. Keep this tab in front.'),
+      h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => ctrl.abort() }, 'Cancel')));
+  document.body.append(box);
+  player.pause();
+  try {
+    const blob = await exportComposite({ ...v, cuts }, {
+      layout: player.layout, ownerName, signal: ctrl.signal,
+      onProgress: (p) => { const pc = Math.round(p * 100); label.textContent = `Making your video… ${pc}%`; bar.firstChild.style.width = `${pc}%`; },
+    });
+    const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+    const name = ($('#title').textContent || 'video').replace(/[^\w\- .]+/g, '').trim().slice(0, 80) || 'video';
+    const a = h('a', { href: URL.createObjectURL(blob), download: `${name}.${ext}` });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 120000);
+    toast('Downloaded');
+  } catch (e) {
+    if (e.name !== 'AbortError') toast(`Couldn’t make the video: ${e.message}`, { bad: true });
+  } finally { box.remove(); }
 }
 
 if (params.has('new')) {
