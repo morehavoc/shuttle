@@ -91,14 +91,17 @@ try {
     const r = await call('/api/login', { method: 'POST', body: { password: PASSWORD } });
     assert.equal(r.status, 200);
     const sc = r.headers.get('set-cookie');
-    assert.match(sc, /shuttle_session=\d+\.[\w-]+/);
+    assert.match(sc, /^__Host-shuttle_session=\d+\.[\w-]+;/);
     assert.match(sc, /HttpOnly/);
+    assert.match(sc, /; Secure/);
+    assert.match(sc, /; Path=\/;/);
+    assert.doesNotMatch(sc, /Domain=/i);
     cookie = sc.split(';')[0];
     assert.equal((await j(await call('/api/me'))).owner, true);
   });
 
   await test('forged cookie is refused', async () => {
-    const r = await call('/api/videos', { anon: true, headers: { Cookie: `shuttle_session=${Date.now() + 1e9}.AAAA` } });
+    const r = await call('/api/videos', { anon: true, headers: { Cookie: `__Host-shuttle_session=${Date.now() + 1e9}.AAAA` } });
     assert.equal(r.status, 401);
   });
 
@@ -272,7 +275,13 @@ try {
     assert.equal((await call(`/raw/${id}/cam`, { anon: true })).status, 404);
     assert.equal((await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=0-9' } })).status, 404);
     assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).status, 404);
-    assert.equal((await call(`/raw/${id}/cam`)).status, 200, 'owner still can');
+    const ownerCam = await call(`/raw/${id}/cam`);
+    assert.equal(ownerCam.status, 200, 'owner still can');
+    assert.equal(ownerCam.headers.get('cache-control'), 'private, no-cache', 'a hidden camera is never cached');
+    const ownerCamThumb = await call(`/thumb/${id}/cam.jpg`);
+    assert.equal(ownerCamThumb.headers.get('content-type'), 'image/jpeg');
+    assert.equal(ownerCamThumb.headers.get('cache-control'), 'private, no-cache');
+    assert.match((await call(`/thumb/${id}.jpg`, { anon: true })).headers.get('cache-control'), /^public/, 'the poster stays public');
     const og = Buffer.from(await (await call(`/thumb/${id}/og.jpg`, { anon: true })).arrayBuffer());
     const poster = Buffer.from(await (await call(`/thumb/${id}.jpg`, { anon: true })).arrayBuffer());
     assert.ok(og.equals(poster), 'link preview is the plain poster');
@@ -283,7 +292,10 @@ try {
     const page = await (await call(`/v/${id}`)).text();
     assert.match(page, /"hasCam":true/, 'owner page keeps the camera to switch back');
     await call(`/api/videos/${id}`, { method: 'PATCH', body: { layout: { kind: 'bubble', corner: 'bl', size: 'm' } } });
-    assert.equal((await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=0-9' } })).status, 206);
+    const shown = await call(`/raw/${id}/cam`, { anon: true, headers: { Range: 'bytes=0-9' } });
+    assert.equal(shown.status, 206);
+    assert.equal(shown.headers.get('cache-control'), 'private, no-cache', 'a visible camera is revalidated, so hiding it takes effect at once');
+    assert.match((await call(`/raw/${id}`, { anon: true, headers: { Range: 'bytes=0-9' } })).headers.get('cache-control'), /^public/, 'the main track stays cacheable');
   });
 
   await test('cuts: normalised on save; viewers never get cut words', async () => {
@@ -312,6 +324,23 @@ try {
     assert.match(html, /Christopher Moravec/);
     assert.doesNotMatch(html, /"views"|"camMutedMs"|"surface"/);
     assert.match(await (await call(`/v/${id}`)).text(), /"owner":true/);
+    // Nothing inline to execute, so script-src 'self' holds: the data rides in a JSON block.
+    assert.match(html, /<script type="application\/json" id="shuttle-data">\{/);
+    for (const tag of html.match(/<script\b[^>]*>/g)) assert.match(tag, /\bsrc=|type="application\/json"/, tag);
+    assert.doesNotMatch(html, /\son[a-z]+=|\sstyle=/i, 'no inline handlers or style attributes');
+  });
+
+  await test('security headers on the app, the share page and the API', async () => {
+    for (const p of ['/', '/index.html', '/app.js', `/v/${id}`, '/v/nosuchvideo1', '/api/me']) {
+      const r = await call(p, { anon: true });
+      const csp = r.headers.get('content-security-policy') || '';
+      assert.match(csp, /frame-ancestors 'none'/, `${p} CSP: ${csp}`);
+      assert.match(csp, /default-src 'self'/, p);
+      assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/, p);
+      assert.equal(r.headers.get('x-content-type-options'), 'nosniff', p);
+      assert.equal(r.headers.get('referrer-policy'), 'strict-origin-when-cross-origin', p);
+    }
+    assert.equal((await call('/_headers', { anon: true })).status, 404, 'the _headers file itself is not served');
   });
 
   await test('empty title refused', async () => {
@@ -463,6 +492,33 @@ try {
     assert.equal(last.status, 429);
     const good = await call('/api/login', { method: 'POST', anon: true, body: { password: PASSWORD } });
     assert.equal(good.status, 429, 'even the right password waits out the lockout');
+  });
+
+  // CF-Connecting-IP is honoured by wrangler dev, so each test below gets its own addresses.
+  const login = (password, ip) => call('/api/login', { method: 'POST', anon: true, body: { password }, headers: { 'CF-Connecting-IP': ip } });
+
+  await test('concurrent wrong passwords from one address get at most 10 checks', async () => {
+    const rs = await Promise.all(Array.from({ length: 60 }, (_, i) => login('bad' + i, '198.51.100.7')));
+    const st = rs.map((r) => r.status);
+    const checked = st.filter((x) => x === 401).length;
+    assert.ok(checked <= 10, `${checked} password checks went through (cap 10)`);
+    assert.ok(checked >= 1, 'some were checked');
+    assert.equal(st.filter((x) => x === 429).length, 60 - checked, `statuses: ${st}`);
+    assert.equal((await login(PASSWORD, '198.51.100.7')).status, 429, 'that address is locked out, right password or not');
+    assert.equal((await login('nope', '198.51.100.8')).status, 401, 'another address is not');
+  });
+
+  await test('a flood from many addresses never locks out the right password', async () => {
+    // 11 + 1 failures so far from this run's other tests; push the last hour past 100.
+    for (let a = 1; a <= 10; a++) await Promise.all(Array.from({ length: 10 }, (_, i) => login('flood' + i, `203.0.113.${a}`)));
+    const owner = await login(PASSWORD, '192.0.2.50');
+    assert.equal(owner.status, 200, 'the right password from a quiet address still signs in');
+    assert.match(owner.headers.get('set-cookie') || '', /^__Host-shuttle_session=/);
+    // While flooded, a fresh address gets 3 checks, not 10.
+    const st = [];
+    for (let i = 0; i < 5; i++) st.push((await login('guess' + i, '192.0.2.60')).status);
+    assert.deepEqual(st, [401, 401, 401, 429, 429]);
+    assert.equal((await login(PASSWORD, '192.0.2.60')).status, 429, 'the per-address cap is still the hard stop');
   });
 
   await test('static app is served', async () => {

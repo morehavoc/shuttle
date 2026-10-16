@@ -60,7 +60,7 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
   <section class="transcript-card" id="transcript" hidden></section>
 </main>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
-<script>window.__SHUTTLE__ = ${data};</script>
+<script type="application/json" id="shuttle-data">${data}</script>
 <script src="/share.js" type="module"></script>
 </body>
 </html>`;

@@ -70,11 +70,24 @@ const launchOpts = ENGINE === 'chromium'
   : {};
 const browser = await pw[ENGINE].launch(launchOpts);
 
+const cspViolations = [], cspDuringShots = [];
 async function newContext() {
   const ctx = await browser.newContext({
     viewport: { width: 1280, height: 860 },
     ignoreHTTPSErrors: true,
     permissions: ENGINE === 'chromium' ? ['camera', 'microphone', 'clipboard-read', 'clipboard-write'] : [],
+  });
+  // Every Content-Security-Policy violation, from any page in this context (checked at the end).
+  // WebKit reports Playwright's own screenshot stylesheet as one, so those are counted apart.
+  let shooting = 0;
+  ctx.on('page', (p) => {
+    const snap = p.screenshot.bind(p);
+    p.screenshot = async (o) => { shooting++; try { return await snap(o); } finally { await new Promise((r) => setTimeout(r, 250)); shooting--; } };
+  });
+  const shotStyle = /apply a stylesheet because|style-src-elem inline/;
+  ctx.on('console', (m) => { const t = m.text(); if (/Content.Security.Policy/i.test(t)) (shooting && shotStyle.test(t) ? cspDuringShots : cspViolations).push(t); });
+  await ctx.addInitScript(() => {
+    document.addEventListener('securitypolicyviolation', (e) => console.error(`Content-Security-Policy violation: ${e.violatedDirective} ${e.blockedURI || ''} ${e.sourceFile || ''}:${e.lineNumber || ''}`));
   });
   // WebKit under Playwright can't grant camera permission on macOS (the prompt never resolves),
   // so it gets synthetic canvas/oscillator streams. That still exercises WebKit's MediaRecorder,
@@ -292,7 +305,7 @@ try {
   await shot('5-share.png');
 
   // ---------- play the composite ----------
-  const meta = await page.evaluate(() => window.__SHUTTLE__.video);
+  const meta = await page.evaluate(() => JSON.parse(document.getElementById('shuttle-data').textContent).video);
   // Reads the time codes burnt into the fake streams: which capture moment each video shows.
   const codes = () => page.evaluate(() => {
     const read = (v) => {
@@ -323,7 +336,7 @@ try {
   await page.waitForTimeout(2600);
   const play = await page.evaluate(() => {
     const m = document.querySelector('.sp-main'), c = document.querySelector('.sp-cam');
-    const off = (window.__SHUTTLE__.video.camOffsetMs || 0) / 1000;
+    const off = (JSON.parse(document.getElementById('shuttle-data').textContent).video.camOffsetMs || 0) / 1000;
     return { t: m.currentTime, paused: m.paused, dur: m.duration, err: m.error && m.error.code, cam: c ? c.currentTime : null, camPaused: c ? c.paused : null, off,
       camBox: c ? (() => { const r = c.parentElement.getBoundingClientRect(); return [Math.round(r.width), Math.round(r.height)]; })() : null };
   });
@@ -522,7 +535,7 @@ try {
   } // !SPEECH
 
   // ---------- export: one file, camera burnt in ----------
-  if (!SPEECH && (MODE === 'screen-camera' || (await page.evaluate(() => (window.__SHUTTLE__.video.cuts || []).length)) || true)) {
+  if (!SPEECH && (MODE === 'screen-camera' || (await page.evaluate(() => (JSON.parse(document.getElementById('shuttle-data').textContent).video.cuts || []).length)) || true)) {
     const expected = await page.evaluate(() => {
       const t = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number);
       return t[0] * 60 + t[1];
@@ -569,7 +582,7 @@ try {
     await vpage.reload();
     await vpage.waitForSelector('.sp');
     const hidden = await vpage.evaluate((id) => Promise.all([fetch(`/raw/${id}/cam`, { headers: { Range: 'bytes=0-1' } }).then((r) => r.status), fetch(`/thumb/${id}/cam.jpg`).then((r) => r.status)])
-      .then(([raw, thumb]) => ({ raw, thumb, el: !!document.querySelector('.sp-cam'), avatar: !!document.querySelector('img.avatar'), hasCam: window.__SHUTTLE__.video.hasCam, og: document.querySelector('meta[property="og:image"]')?.content })), meta.id);
+      .then(([raw, thumb]) => ({ raw, thumb, el: !!document.querySelector('.sp-cam'), avatar: !!document.querySelector('img.avatar'), hasCam: JSON.parse(document.getElementById('shuttle-data').textContent).video.hasCam, og: document.querySelector('meta[property="og:image"]')?.content })), meta.id);
     check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s$/.test(hidden.og || ''),
       'Screen layout: viewers get no camera file, camera thumbnail, avatar or face in the preview', `Screen layout leaks the camera: ${JSON.stringify(hidden)}`);
     await vpage.screenshot({ path: path.join(out, '12b-viewer-screen-layout.png') });
@@ -586,6 +599,7 @@ try {
   await page.waitForSelector('.card');
   await shot('13-library-after.png');
   ok('library shows the video');
+  check(cspViolations.length === 0, `no Content-Security-Policy violations${cspDuringShots.length ? ` (${cspDuringShots.length} console lines during Playwright screenshots set aside)` : ''}`, `CSP violations: ${[...new Set(cspViolations)].slice(0, 8).join(' | ')}`);
   console.log(`VIDEO_ID=${meta.id}`);
 } catch (e) {
   if (e.expected) ok('fault scenario complete');

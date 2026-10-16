@@ -13,7 +13,11 @@ import { normalizeCuts, isWordCut } from '../public/timeline.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
 const SESSION_DAYS = 90;
-const COOKIE = 'shuttle_session';
+// __Host-: only ever set by this origin over HTTPS, Path=/, no Domain.
+const COOKIE = '__Host-shuttle_session';
+const LOGIN_PER_IP = 10; // password checks per address per 15 minutes
+const LOGIN_PER_IP_FLOOD = 3; // ... while more than LOGIN_GLOBAL failures came in the last hour
+const LOGIN_GLOBAL = 100;
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ALLOWED_MIME = /^video\/(webm|mp4|x-matroska|quicktime)(;.*)?$/i;
 const ID = '([A-Za-z0-9]{6,32})';
@@ -108,20 +112,32 @@ async function login(request, env) {
   const given = String(body.password || '');
   const ip = request.headers.get('CF-Connecting-IP') || 'local';
   const now = Date.now();
-  const recent = await env.DB.prepare(
-    'SELECT (SELECT COUNT(*) FROM login_failures WHERE ip = ? AND at > ?) AS mine, (SELECT COUNT(*) FROM login_failures WHERE at > ?) AS everyone'
-  ).bind(ip, now - 15 * 60e3, now - 60 * 60e3).first();
-  if (recent.mine >= 10 || recent.everyone >= 100) throw new HttpError(429, 'Too many tries. Wait 15 minutes.');
+  // The attempt is recorded before it is counted, in one transaction, so concurrent requests
+  // each see the others and at most LOGIN_PER_IP of them get to check the password.
+  const [ins, counts] = await env.DB.batch([
+    env.DB.prepare('INSERT INTO login_failures (ip, at) VALUES (?, ?) RETURNING rowid AS rid').bind(ip, now),
+    env.DB.prepare(
+      'SELECT (SELECT COUNT(*) FROM login_failures WHERE ip = ? AND at > ?) AS mine, (SELECT COUNT(*) FROM login_failures WHERE at > ?) AS everyone'
+    ).bind(ip, now - 15 * 60e3, now - 60 * 60e3),
+  ]);
+  const rid = ins.results[0].rid;
+  const recent = counts.results[0];
+  // A flood from many addresses shrinks every address's allowance, but never blocks one that
+  // hasn't been guessing: the owner's right password still gets in.
+  const allowed = recent.everyone > LOGIN_GLOBAL ? LOGIN_PER_IP_FLOOD : LOGIN_PER_IP;
+  if (recent.mine > allowed) {
+    // Refused attempts don't count (only checked ones do), so hammering doesn't extend the wait.
+    await env.DB.prepare('DELETE FROM login_failures WHERE rowid = ?').bind(rid).run();
+    throw new HttpError(429, 'Too many tries. Wait 15 minutes.');
+  }
   const ok = await safeEqual(given, env.OWNER_PASSWORD);
   if (!ok) {
-    await env.DB.batch([
-      env.DB.prepare('INSERT INTO login_failures (ip, at) VALUES (?, ?)').bind(ip, now),
-      env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - 864e5),
-    ]);
+    // The row inserted above is the failure record.
+    await env.DB.prepare('DELETE FROM login_failures WHERE at < ?').bind(now - 864e5).run();
     await new Promise((r) => setTimeout(r, 600));
     throw new HttpError(401, 'Wrong password');
   }
-  await env.DB.prepare('DELETE FROM login_failures WHERE ip = ?').bind(ip).run();
+  await env.DB.prepare('DELETE FROM login_failures WHERE ip = ? OR rowid = ?').bind(ip, rid).run();
   const exp = Date.now() + SESSION_DAYS * 864e5;
   const sig = await hmac(env, `owner.${exp}`);
   const cookie = `${COOKIE}=${exp}.${sig}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`;
@@ -518,7 +534,9 @@ async function rawVideo(request, env, id, track, url) {
     'Content-Type': mime,
     'Accept-Ranges': 'bytes',
     'ETag': head.httpEtag,
-    'Cache-Control': download ? 'private, no-store' : 'public, max-age=300',
+    // The camera can be hidden from viewers at any time (and the owner still gets it then), so
+    // no cache may keep it or serve it without asking again.
+    'Cache-Control': download ? 'private, no-store' : track === 'cam' ? 'private, no-cache' : 'public, max-age=300',
     'X-Content-Type-Options': 'nosniff',
   });
   if (download) {
@@ -562,7 +580,8 @@ async function thumb(request, env, id, variant) {
   if (!obj) {
     return new Response(PLACEHOLDER_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' } });
   }
-  return new Response(obj.body, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'public, max-age=3600' } });
+  // The camera thumbnail is his face and can be hidden later: same rule as the camera track.
+  return new Response(obj.body, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': variant === 'cam' ? 'private, no-cache' : 'public, max-age=3600' } });
 }
 
 // ---------- helpers ----------
@@ -685,17 +704,22 @@ function b64url(bytes) {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+// Same policy as public/_headers (static files); keep the two in step.
+const CSP = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.bunny.net; font-src https://fonts.bunny.net; "
+  + "media-src 'self' blob:; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+
 function securityHeaders() {
   return {
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Content-Security-Policy': CSP,
   };
 }
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra },
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders(), ...extra },
   });
 }
 

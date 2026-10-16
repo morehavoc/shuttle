@@ -112,9 +112,10 @@ export class Bubble extends EventTarget {
     this.win = win;
     const d = win.document;
     d.title = 'Shuttle';
-    const style = d.createElement('style');
-    style.textContent = CSS;
-    d.head.append(style);
+    // A constructed sheet, not a <style> element: the PiP window inherits the page's CSP.
+    const sheet = new win.CSSStyleSheet();
+    sheet.replaceSync(CSS);
+    d.adoptedStyleSheets = [sheet];
     const video = d.createElement('video');
     video.muted = true; video.playsInline = true;
     video.srcObject = this.stream;

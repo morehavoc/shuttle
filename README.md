@@ -63,7 +63,7 @@ npm run dev                                       # migrations + wrangler dev --
 - `npm test` runs:
   - the timeline maths (17 checks);
   - the transcript post-processing (17);
-  - the API contract (36), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+  - the API contract (41), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
 - `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
   - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
   - `SURFACE=window` (a window share keeps the bubble)
@@ -85,5 +85,6 @@ public/bubble.js     floating self-view (PiP)
 public/player.js     composite player: layouts, camera sync, cut skipping, captions
 public/share.js      share page: transcript, editing, owner controls
 public/timeline.js   cuts and words (shared by the browser and the Worker)
+public/_headers      security headers for the static files (the Worker sets the same on its pages)
 migrations/          D1 schema
 ```

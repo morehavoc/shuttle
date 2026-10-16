@@ -4,7 +4,7 @@ import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
 } from './timeline.js';
 
-const { video: v, owner, ownerName } = window.__SHUTTLE__;
+const { video: v, owner, ownerName } = JSON.parse(document.getElementById('shuttle-data').textContent);
 const shareUrl = `${location.origin}/v/${v.id}`;
 const params = new URLSearchParams(location.search);
 if (params.has('new')) history.replaceState(null, '', `/v/${v.id}`);

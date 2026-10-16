@@ -8,6 +8,7 @@ export function h(tag, attrs = {}, ...children) {
     if (v == null || v === false) continue;
     if (k === 'class') el.className = v;
     else if (k === 'html') el.innerHTML = v;
+    else if (k === 'style') el.style.cssText = v; // CSSOM, so the CSP needs no 'unsafe-inline'
     else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
     else el.setAttribute(k, v === true ? '' : v);
   }
