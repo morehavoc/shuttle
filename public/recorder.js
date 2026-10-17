@@ -345,7 +345,7 @@ class AudioTap {
 // ---------- one recording session ----------
 
 export class Session extends EventTarget {
-  constructor({ mode, cameraStream, micStream, audioCtx, layout, keepDays }) {
+  constructor({ mode, cameraStream, micStream, audioCtx, layout, keepDays, speed }) {
     super();
     this.mode = mode;
     this.cameraStream = cameraStream || null;
@@ -353,6 +353,7 @@ export class Session extends EventTarget {
     this.audioCtx = audioCtx || null; // created inside the click, for the transcript tap
     this.layout = layout || null;
     this.keepDays = keepDays === undefined ? 'forever' : keepDays;
+    this.speed = speed == null ? null : speed;
     this.displayStream = null;
     this.surface = mode === 'camera' ? 'camera' : '';
     this.chunks = { main: [], cam: [] };
@@ -407,6 +408,7 @@ export class Session extends EventTarget {
         surface: this.surface,
         layout: this.layout,
         keepDays: this.keepDays,
+        speed: this.speed,
         tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
       },
     });

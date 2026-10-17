@@ -205,8 +205,27 @@ function ownerPanel() {
     sync();
     parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
   }
+  parts.push(speedRow());
   parts.push(keepRow());
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
+}
+
+const SPEED_CHOICES = [1, 1.2, 1.5, 2];
+function speedRow() {
+  const seg = h('div', { class: 'seg seg-inline seg-small', role: 'group', 'aria-label': 'Starts at speed' },
+    ...SPEED_CHOICES.map((s) => h('button', { type: 'button', 'data-speed': String(s), onclick: () => save(s) }, `${s}×`)));
+  const sync = () => seg.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.speed) === (v.speed ?? 1))));
+  async function save(s) {
+    try {
+      const out = await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { speed: s } });
+      v.speed = out.speed;
+      localStorage.setItem('shuttle.defaultSpeed', JSON.stringify(s)); // the next recording starts here
+      if (player) player.setSpeed(s);
+      sync();
+    } catch (e) { toast(e.message, { bad: true }); }
+  }
+  sync();
+  return h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Speed'), seg);
 }
 
 const KEEP = [{ d: 7, label: '7 days' }, { d: 30, label: '30 days' }, { d: 90, label: '90 days' }, { d: 'forever', label: 'Forever' }];

@@ -584,11 +584,26 @@ try {
     check(bad === 0, 'stored screen file decodes with no errors', `stored screen file: ${bad} decode errors`);
   }
 
+  // The owner picks the speed the link starts at.
+  await page.click('.owner-panel button[data-speed="1.2"]');
+  await page.waitForTimeout(700);
+  const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
+  check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
+
   // ---------- what a viewer sees ----------
   const vctx = await newContext();
   const vpage = await vctx.newPage();
   await vpage.goto(shareUrl);
   await vpage.waitForSelector('.sp');
+  const vSpeed = await vpage.evaluate(() => document.querySelector('.sp-main, .sp video').playbackRate);
+  check(vSpeed === 1.2, 'viewer\'s player starts at the owner\'s speed', `viewer starts at ${vSpeed}`);
+  await vpage.click('.sp-big'); // the controls appear once it's playing
+  await vpage.waitForTimeout(600);
+  await vpage.hover('.sp');
+  await vpage.click('.sp-speed');
+  await vpage.click('.sp-speed-menu button[data-speed="1.5"]');
+  const vPicked = await vpage.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, menu: document.querySelector('.sp-speed-menu').hidden, label: document.querySelector('.sp-speed').textContent }));
+  check(vPicked.rate === 1.5 && vPicked.menu && vPicked.label === '1.5×', 'viewer changes speed from the menu', `viewer speed menu: ${JSON.stringify(vPicked)}`);
   await vpage.waitForSelector('.tc-body .w', { timeout: 15000 }).catch(() => {});
   const viewer = await vpage.evaluate(() => ({
     download: !!Array.from(document.querySelectorAll('button, a')).find((b) => /Download/.test(b.textContent)),
