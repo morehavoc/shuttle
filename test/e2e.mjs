@@ -10,6 +10,8 @@
 //   STOP=share      → end the screen share from "the browser" (track stopped, no 'ended' event,
 //                     like Safari's own Stop sharing); one stop must finish the recording
 //   CAM_END=1       → the camera stops mid-recording; the player must hold its last frame
+//   RESIZE=1        → the fake screen grows 10% mid-recording (a resized window); the stored
+//                     screen file must still decode cleanly (Chrome's MP4 recorder breaks on it)
 //   SPEECH=1        → the fake mic speaks a sentence every 4 s; with a server using a real
 //                     transcriber (TRANSCRIBE=real sh test/serve.sh) checks the words' timing
 // Playwright is resolved from PLAYWRIGHT_DIR (default: ../node_modules/playwright).
@@ -34,7 +36,7 @@ const OFFSET_MS = Number(process.env.OFFSET_MS || 0);
 const CAM_END = !!process.env.CAM_END;
 const SPEECH = !!process.env.SPEECH;
 const FAKE_MEDIA = ENGINE === 'webkit' || !!process.env.FAKE || SPEECH || OFFSET_MS > 0 || CAM_END;
-const out = path.join(root, 'test', 'out', `${ENGINE}-${MODE}${process.env.SURFACE ? '-' + process.env.SURFACE : ''}${SPEECH ? '-speech' : ''}${OFFSET_MS ? '-offset' : ''}${CAM_END ? '-camend' : ''}`);
+const out = path.join(root, 'test', 'out', `${ENGINE}-${MODE}${process.env.SURFACE ? '-' + process.env.SURFACE : ''}${process.env.RESIZE ? '-resize' : ''}${SPEECH ? '-speech' : ''}${OFFSET_MS ? '-offset' : ''}${CAM_END ? '-camend' : ''}`);
 mkdirSync(out, { recursive: true });
 
 // Different sentences (Whisper collapses a phrase repeated over and over), each with a distinct
@@ -93,7 +95,7 @@ async function newContext() {
   // so it gets synthetic canvas/oscillator streams. That still exercises WebKit's MediaRecorder,
   // the upload path and the player.
   if (FAKE_MEDIA) {
-    await ctx.addInitScript(({ noise, surface, speech, offsetMs }) => {
+    await ctx.addInitScript(({ noise, surface, speech, offsetMs, resize }) => {
       const camIds = new Set();
       window.__rec = [];    // MediaRecorder start/pause/resume/stop, by wall clock
       if (speech.length) window.__shuttleTapLog = [];
@@ -107,8 +109,19 @@ async function newContext() {
       }
       function fakeVideo(w, h, label) {
         const c = document.createElement('canvas'); c.width = w; c.height = h;
+        if (label === 'SCREEN') window.__screenCanvas = c;
+        // RESIZE: grow the "window" 3 s after recording starts.
+        if (label === 'SCREEN' && resize && !window.__resizeHooked) {
+          window.__resizeHooked = true;
+          const start = MediaRecorder.prototype.start;
+          MediaRecorder.prototype.start = function (...a) {
+            if (!window.__resizeArmed) { window.__resizeArmed = true; setTimeout(() => { c.width = 2112; c.height = 1188; }, 3000); }
+            return start.apply(this, a);
+          };
+        }
         const g = c.getContext('2d'); let f = 0;
         const draw = () => {
+          const w = c.width, h = c.height;
           f++; g.fillStyle = `hsl(${(f * 2) % 360},60%,35%)`; g.fillRect(0, 0, w, h);
           if (noise) for (let i = 0; i < 400; i++) { g.fillStyle = `hsl(${Math.random() * 360},80%,50%)`; g.fillRect(Math.random() * w, Math.random() * h, 40, 40); }
           g.fillStyle = '#fff'; g.font = `${Math.round(h / 8)}px sans-serif`; g.fillText(`${label} ${f}`, w / 10, h / 2);
@@ -179,7 +192,7 @@ async function newContext() {
         const orig = R[ev];
         R[ev] = function (...a) { window.__rec.push({ ev, cam: isCam(this), t: performance.now() }); return orig.apply(this, a); };
       }
-    }, { noise: !!process.env.NOISE, surface: process.env.SURFACE || '', speech, offsetMs: OFFSET_MS });
+    }, { noise: !!process.env.NOISE, surface: process.env.SURFACE || '', speech, offsetMs: OFFSET_MS, resize: !!process.env.RESIZE });
   }
   return ctx;
 }
@@ -556,6 +569,19 @@ try {
       execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-ss', String(Math.max(1, dur / 2)), '-i', f, '-frames:v', '1', frame]);
       ok(`export frame saved (${path.basename(frame)})`);
     }
+  }
+
+  // The stored screen file must decode cleanly end to end (a broken stretch stops Chrome's
+  // player dead; see fixedSizeTrack in recorder.js).
+  if (MODE !== 'camera' && !FAULT) {
+    const raw = path.join(out, 'stored-screen.mp4');
+    (await import('node:fs')).writeFileSync(raw, await (await page.request.get(`${BASE}/raw/${meta.id}`)).body());
+    let errs = '';
+    try { execFileSync('ffmpeg', ['-v', 'error', '-i', raw, '-map', '0:v', '-f', 'null', '-'], { stdio: ['ignore', 'ignore', 'pipe'] }); }
+    catch (e) { errs = String(e.stderr || e.message); }
+    const bad = (errs.match(/error while decoding|concealing|corrupt/gi) || []).length;
+    if (process.env.RESIZE) console.log(`       screen file: ${JSON.stringify(JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', raw]).toString()).streams[0])}`);
+    check(bad === 0, 'stored screen file decodes with no errors', `stored screen file: ${bad} decode errors`);
   }
 
   // ---------- what a viewer sees ----------
