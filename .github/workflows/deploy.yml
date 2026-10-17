@@ -6,6 +6,12 @@
 #                          (if the deploy fails on the AI binding, add Workers AI Read)
 #   CLOUDFLARE_ACCOUNT_ID
 #   OWNER_PASSWORD         the password you sign in with
+#   SHUTTLE_DOMAIN         optional: a hostname like videos.example.com, served as a Workers Custom
+#                          Domain (Cloudflare creates the DNS record and certificate). The zone must be
+#                          on this account and the hostname must not already have a CNAME. The token
+#                          also needs zone access for that zone: Workers Routes Edit, DNS Edit, Zone Read.
+#                          Unset = workers.dev only. Removing it later does not detach the domain; do
+#                          that in the dashboard (Workers -> shuttle -> Domains & Routes).
 # SESSION_SECRET is generated on the first deploy and never leaves Cloudflare.
 name: Deploy
 
@@ -80,8 +86,26 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SHUTTLE_DOMAIN: ${{ secrets.SHUTTLE_DOMAIN }}
         run: |
           set -euo pipefail
+          if [ -n "${SHUTTLE_DOMAIN:-}" ]; then
+            D=$(printf '%s' "$SHUTTLE_DOMAIN" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+            if ! printf '%s' "$D" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$'; then
+              echo "::error::SHUTTLE_DOMAIN must be a bare hostname like videos.example.com (no https://, path or port)"; exit 1
+            fi
+            # A top-level [[routes]] table has to sit before the [env.local] tables.
+            python3 - "$D" <<'PY'
+          import sys
+          d = sys.argv[1]
+          p = 'wrangler.toml'
+          s = open(p).read()
+          block = f'[[routes]]\npattern = "{d}"\ncustom_domain = true\n\n'
+          assert '[env.local]' in s and '[[routes]]' not in s
+          open(p, 'w').write(s.replace('[env.local]', block + '[env.local]', 1))
+          PY
+            echo "https://$D" > domain.txt
+          fi
           npx wrangler deploy | tee deploy.log
           grep -Eo 'https://[a-z0-9.-]+\.workers\.dev' deploy.log | head -1 > url.txt || true
 
@@ -101,10 +125,16 @@ jobs:
       - name: Verify
         if: steps.check.outputs.ready == 'true'
         run: |
-          URL=$(cat url.txt)
-          if [ -z "$URL" ]; then echo "No workers.dev URL in the deploy output (custom domain only?) — skipping"; exit 0; fi
-          for _ in $(seq 1 30); do
-            if curl -fsS "$URL/api/me" | grep -q '"passwordSet":true'; then echo "live at $URL"; exit 0; fi
-            sleep 4
-          done
-          echo "::error::$URL/api/me did not answer with passwordSet:true"; exit 1
+          check() {  # $1 = base URL, $2 = tries (4 s apart)
+            for _ in $(seq 1 "$2"); do
+              if curl -fsS "$1/api/me" | grep -q '"passwordSet":true'; then echo "live at $1"; return 0; fi
+              sleep 4
+            done
+            echo "::error::$1/api/me did not answer with passwordSet:true"; return 1
+          }
+          ok=0
+          URL=$(cat url.txt 2>/dev/null || true)
+          if [ -n "$URL" ]; then check "$URL" 30 || ok=1; else echo "No workers.dev URL in the deploy output"; fi
+          # A new Custom Domain needs its DNS record and certificate first; allow ~5 minutes.
+          if [ -s domain.txt ]; then check "$(cat domain.txt)" 75 || ok=1; fi
+          exit $ok
