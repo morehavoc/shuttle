@@ -40,8 +40,9 @@ Deploys run only through GitHub Actions (`.github/workflows/deploy.yml`). The wo
 | `CLOUDFLARE_API_TOKEN` | Account token: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit. If the deploy fails on the `AI` binding, add Workers AI Read. |
 | `CLOUDFLARE_ACCOUNT_ID` | Your account id |
 | `OWNER_PASSWORD` | The password you sign in with |
+| `SHUTTLE_DOMAIN` | Optional. A hostname like `videos.example.com` (see below) |
 
-Then push to `main`, or go to **Actions → Deploy → Run workflow**. Until the secrets exist, the workflow runs the tests and skips the deploy. `SESSION_SECRET` is generated on the first deploy. The app answers at `https://shuttle.<your-subdomain>.workers.dev`. To use a custom domain, add a `routes` entry to `wrangler.toml` (and give the token Zone Workers Routes Edit).
+Then push to `main`, or go to **Actions → Deploy → Run workflow**. Until the secrets exist, the workflow runs the tests and skips the deploy. `SESSION_SECRET` is generated on the first deploy. The app answers at `https://shuttle.<your-subdomain>.workers.dev`. To serve it on your own hostname, add a fourth secret, `SHUTTLE_DOMAIN` (for example `videos.example.com`, no `https://`). The deploy adds it as a Workers Custom Domain, and Cloudflare creates the DNS record and certificate. The hostname's zone must be on the same Cloudflare account and must not already have a CNAME for it. Give the token zone access for that zone (Workers Routes Edit, DNS Edit, Zone Read). The `workers.dev` address keeps working too. Deleting the secret later doesn't detach the domain; remove it in the dashboard under the Worker's Domains & Routes.
 
 **Costs and limits.**
 - R2 gives 10 GB free, about 6 hours of 1080p screen recording at 3.5 Mbps; the camera file adds about a third. Egress is free.
