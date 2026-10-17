@@ -51,6 +51,44 @@ export function displayMediaOptions() {
   };
 }
 
+// Chrome's MP4 recorder writes undecodable video for everything after its input changes size
+// (a shared window resized, a tab switch): the encoder restarts with new settings the file
+// never records, so Chrome stops playing at that point and Safari shows stripes. Here each
+// screen frame is drawn into a frame of the starting size (scaled to fit, black bars if the
+// shape changes), so the recorder's input never changes size. The pipeline is driven by frames
+// arriving, not timers, so it keeps running in a background tab. Safari's recorder handles a
+// resize itself and has no MediaStreamTrackProcessor, so it gets the track unchanged.
+function fixedSizeTrack(track, width, height) {
+  const W = width & ~1, H = height & ~1;
+  if (!W || !H || !window.MediaStreamTrackProcessor || !window.MediaStreamTrackGenerator || !window.OffscreenCanvas) {
+    return { track, close() {} };
+  }
+  let gen;
+  try {
+    const canvas = new OffscreenCanvas(W, H);
+    const ctx = canvas.getContext('2d');
+    const proc = new MediaStreamTrackProcessor({ track });
+    gen = new MediaStreamTrackGenerator({ kind: 'video' });
+    try { gen.contentHint = track.contentHint; } catch {}
+    proc.readable.pipeThrough(new TransformStream({
+      transform(frame, out) {
+        try {
+          const fw = frame.displayWidth, fh = frame.displayHeight;
+          if (fw === W && fh === H) { out.enqueue(frame); return; }
+          const k = Math.min(W / fw, H / fh);
+          const dw = Math.round(fw * k), dh = Math.round(fh * k);
+          ctx.fillStyle = '#000';
+          ctx.fillRect(0, 0, W, H);
+          ctx.drawImage(frame, (W - dw) >> 1, (H - dh) >> 1, dw, dh);
+          out.enqueue(new VideoFrame(canvas, { timestamp: frame.timestamp }));
+          frame.close();
+        } catch (e) { try { frame.close(); } catch {} }
+      },
+    })).pipeTo(gen.writable).catch(() => {});
+  } catch { return { track, close() {} }; }
+  return { track: gen, close() { try { gen.stop(); } catch {} } };
+}
+
 // Mixes any number of audio tracks into one. Returns { track, close }. A microphone alone is
 // recorded directly. Anything else goes through an audio graph, whose output never stops: in
 // Chrome's MP4 recorder, audio that stops arriving after a pause/resume is lost for good.
@@ -426,7 +464,9 @@ export class Session extends EventTarget {
     this.width = set.width || 0;
     this.height = set.height || 0;
 
-    const mainStream = new MediaStream(this.mixer.track ? [videoTrack, this.mixer.track] : [videoTrack]);
+    this.fixed = isScreen ? fixedSizeTrack(videoTrack, this.width, this.height) : null;
+    const recTrack = this.fixed ? this.fixed.track : videoTrack;
+    const mainStream = new MediaStream(this.mixer.track ? [recTrack, this.mixer.track] : [recTrack]);
     this.recorders = { main: this.makeRecorder(mainStream, this.mime, isScreen ? 3_500_000 : 2_500_000, 'main') };
     if (this.uploaders.cam) {
       const camTrack = this.cameraStream.getVideoTracks()[0];
@@ -581,6 +621,7 @@ export class Session extends EventTarget {
     // The camera too, so its light (and the bubble) show at once that recording stopped.
     if (this.cameraStream) this.cameraStream.getTracks().forEach((t) => t.stop());
     if (this.mixer) this.mixer.close();
+    if (this.fixed) this.fixed.close();
   }
 
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
