@@ -6,7 +6,7 @@
 import { normalizeCuts, keepSegments, editedDuration, toEdited, toSource, cutAt, captionLines } from './timeline.js';
 import { h, icon, fmtDuration } from './ui.js';
 
-const SPEEDS = [1, 1.25, 1.5, 2];
+const SPEEDS = [1, 1.2, 1.25, 1.5, 1.75, 2]; // same list as the server's PLAY_SPEEDS
 const BUBBLE = { s: 0.2, m: 0.27, l: 0.36 };
 const CARD = { s: 0.16, m: 0.21, l: 0.27 };
 
@@ -72,17 +72,21 @@ export class Player extends EventTarget {
     this.playBtn = h('button', { class: 'sp-btn', type: 'button', 'aria-label': 'Play', html: ico.play });
     this.time = h('span', { class: 'sp-time' }, '0:00');
     this.scrub = h('input', { class: 'sp-scrub', type: 'range', min: '0', max: '1', step: '0.01', value: '0', 'aria-label': 'Seek' });
-    this.speedBtn = h('button', { class: 'sp-btn sp-speed', type: 'button', 'aria-label': 'Speed' }, '1×');
+    this.speedBtn = h('button', { class: 'sp-btn sp-speed', type: 'button', 'aria-label': 'Speed', 'aria-haspopup': 'menu', 'aria-expanded': 'false' }, '1×');
+    this.speedMenu = h('div', { class: 'sp-speed-menu', role: 'menu', hidden: true },
+      ...SPEEDS.map((s) => h('button', { type: 'button', role: 'menuitemradio', 'data-speed': String(s), onclick: (e) => { e.stopPropagation(); this.pickSpeed(s); } }, `${s}×`)));
+    this.speedWrap = h('div', { class: 'sp-speed-wrap' }, this.speedBtn, this.speedMenu);
     this.ccBtn = h('button', { class: 'sp-btn', type: 'button', 'aria-label': 'Captions', 'aria-pressed': 'false', html: ico.cc, hidden: true });
     this.muteBtn = h('button', { class: 'sp-btn', type: 'button', 'aria-label': 'Mute', html: ico.vol });
     this.fullBtn = h('button', { class: 'sp-btn', type: 'button', 'aria-label': 'Full screen', html: ico.full });
-    this.controls = h('div', { class: 'sp-controls' }, this.playBtn, this.time, this.scrub, this.speedBtn, this.ccBtn, this.muteBtn, this.fullBtn);
+    this.controls = h('div', { class: 'sp-controls' }, this.playBtn, this.time, this.scrub, this.speedWrap, this.ccBtn, this.muteBtn, this.fullBtn);
 
     this.el = h('div', { class: 'sp', tabindex: '0', 'data-kind': this.layout.kind },
       h('div', { class: 'sp-bg' }), this.mainWrap, this.camWrap || null, this.caption, this.spinner, this.bigPlay, this.endBox, this.controls);
     host.replaceChildren(this.el);
 
-    const speed = pref.get('speed', 1);
+    // The owner's pick for this video wins; without one, the viewer's own last choice.
+    const speed = SPEEDS.includes(this.v.speed) ? this.v.speed : pref.get('speed', 1);
     this.setSpeed(SPEEDS.includes(speed) ? speed : 1);
     this.setCaptions(pref.get('cc', false));
   }
@@ -94,11 +98,8 @@ export class Player extends EventTarget {
     this.playBtn.addEventListener('click', onPlayClick);
     this.mainWrap.addEventListener('click', onPlayClick);
     if (this.camWrap) this.camWrap.addEventListener('click', onPlayClick);
-    this.speedBtn.addEventListener('click', () => {
-      const i = SPEEDS.indexOf(this.speed);
-      this.setSpeed(SPEEDS[(i + 1) % SPEEDS.length]);
-      pref.set('speed', this.speed);
-    });
+    this.speedBtn.addEventListener('click', (e) => { e.stopPropagation(); this.toggleSpeedMenu(); });
+    document.addEventListener('click', (e) => { if (!this.speedWrap.contains(e.target)) this.toggleSpeedMenu(false); });
     this.ccBtn.addEventListener('click', () => { this.setCaptions(!this.cc); pref.set('cc', this.cc); });
     this.muteBtn.addEventListener('click', () => {
       m.muted = !m.muted;
@@ -352,6 +353,21 @@ export class Player extends EventTarget {
     this.main.defaultPlaybackRate = s;
     if (this.cam) this.cam.playbackRate = s;
     this.speedBtn.textContent = `${s}×`;
+    this.speedMenu.querySelectorAll('button').forEach((b) => b.setAttribute('aria-checked', String(Number(b.dataset.speed) === s)));
+  }
+
+  toggleSpeedMenu(open = this.speedMenu.hidden) {
+    this.speedMenu.hidden = !open;
+    this.speedBtn.setAttribute('aria-expanded', String(open));
+    if (open) this.showControls();
+  }
+
+  // A viewer's choice also becomes their default for videos without an owner's pick.
+  pickSpeed(s) {
+    this.setSpeed(s);
+    pref.set('speed', s);
+    this.toggleSpeedMenu(false);
+    this.dispatchEvent(new CustomEvent('speed', { detail: s }));
   }
 
   setCaptions(on) {
@@ -399,6 +415,8 @@ export class Player extends EventTarget {
     else if (k === 'f') this.toggleFullscreen();
     else if (k === 'm') this.muteBtn.click();
     else if (k === 'c' && !this.ccBtn.hidden) this.ccBtn.click();
+    else if (k === '>' || k === '<') { const i = SPEEDS.indexOf(this.speed) + (k === '>' ? 1 : -1); if (i >= 0 && i < SPEEDS.length) this.pickSpeed(SPEEDS[i]); }
+    else if (k === 'Escape') this.toggleSpeedMenu(false);
   }
 
   isFullscreen() { return (document.fullscreenElement || document.webkitFullscreenElement) === this.el; }

@@ -359,6 +359,18 @@ a { color: inherit; }
 .sp-btn svg { width: 20px; height: 20px; }
 .sp-btn[aria-pressed="true"] { color: var(--accent-2); }
 .sp-speed { width: auto; padding: 0 8px; font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; }
+.sp-speed-wrap { position: relative; flex: none; }
+.sp-speed-menu {
+  position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 5; display: grid; padding: 4px; min-width: 76px;
+  background: rgba(20, 21, 24, .94); border-radius: 10px; box-shadow: 0 6px 20px rgba(0, 0, 0, .4);
+}
+.sp-speed-menu[hidden] { display: none; }
+.sp-speed-menu button {
+  border: 0; background: transparent; color: #fff; font: inherit; font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums;
+  padding: 7px 12px; border-radius: 7px; text-align: right; cursor: pointer;
+}
+.sp-speed-menu button:hover { background: rgba(255, 255, 255, .14); }
+.sp-speed-menu button[aria-checked="true"] { background: rgba(255, 255, 255, .2); }
 .sp-time { color: #fff; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; padding: 0 6px; }
 .sp-scrub { flex: 1; min-width: 40px; height: 22px; margin: 0 6px; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none; --p: 0%; }
 .sp-scrub::-webkit-slider-runnable-track { height: 4px; border-radius: 4px; background: linear-gradient(to right, var(--accent) var(--p), rgba(255, 255, 255, .32) var(--p)); }

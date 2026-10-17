@@ -409,6 +409,24 @@ try {
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
+  await test('starting speed: owner picks it, viewers see it, bad values refused', async () => {
+    let c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', speed: 1.2 } }));
+    assert.equal((await j(await call(`/api/videos/${c.id}`))).speed, 1.2, 'set at creation');
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
+    c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', speed: 9 } }));
+    assert.equal(c.id.length > 0, true, 'a stale default never blocks a recording');
+    assert.equal((await j(await call(`/api/videos/${c.id}`))).speed, null);
+    let r = await j(await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { speed: 1.5 } }));
+    assert.equal(r.speed, 1.5);
+    assert.equal((await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { speed: 1.3 } })).status, 400);
+    assert.equal((await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { speed: 'fast' } })).status, 400);
+    const html = await (await call(`/v/${c.id}`, { anon: true })).text();
+    assert.match(html, /"speed":1\.5/, 'the share page carries it for viewers');
+    r = await j(await call(`/api/videos/${c.id}`, { method: 'PATCH', body: { speed: null } }));
+    assert.equal(r.speed, null, 'cleared back to the viewer\'s own choice');
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
+  });
+
   await test('expiry: keep forever, or expire — expired videos vanish and get swept', async () => {
     const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
     await call(`/api/videos/${c.id}/parts/1`, { method: 'PUT', body: new Uint8Array(sample.subarray(0, 1000)) });

@@ -26,6 +26,7 @@ const THUMBS = ['poster', 'cam', 'og'];
 const LAYOUT_KINDS = ['bubble', 'card', 'side', 'screen'];
 const CORNERS = ['bl', 'br', 'tl', 'tr'];
 const SIZES = ['s', 'm', 'l'];
+const PLAY_SPEEDS = [1, 1.2, 1.25, 1.5, 1.75, 2];
 const DEFAULT_LAYOUT = { kind: 'bubble', corner: 'bl', size: 'm' };
 const MAX_AUDIO_CHUNK = 8 * 1024 * 1024;
 const STALE_CHUNK_MS = 2 * 60e3;
@@ -195,11 +196,13 @@ async function createVideo(request, env, url) {
   const layout = JSON.stringify(cleanLayout(body.layout) || DEFAULT_LAYOUT);
   const now = Date.now();
   const keep = keepDays(body.keepDays, 1);
+  // A stale default in the recorder's storage must never stop a recording: ignore it.
+  const speed = PLAY_SPEEDS.includes(Number(body.speed)) ? Number(body.speed) : null;
   await env.DB.prepare(
-    `INSERT INTO videos (id, title, mode, mime, status, upload_id, cam_mime, cam_upload_id, surface, layout, expires_at, created_at, updated_at)
-     VALUES (?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO videos (id, title, mode, mime, status, upload_id, cam_mime, cam_upload_id, surface, layout, expires_at, speed, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'recording', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(id, title, mode, mime.split(';')[0], main.uploadId, camUploadId ? camMime.split(';')[0] : null, camUploadId,
-    cleanSurface(body.surface), layout, keep === null ? null : now + keep * DAY, now, now).run();
+    cleanSurface(body.surface), layout, keep === null ? null : now + keep * DAY, speed, now, now).run();
   return json({ id, title, partSize: PART_SIZE, shareUrl: `${url.origin}/v/${id}`, hasCam: !!camUploadId }, 201);
 }
 
@@ -308,6 +311,9 @@ async function patchVideo(request, env, id, url) {
   if (body.description !== undefined) {
     if (typeof body.description !== 'string') throw new HttpError(400, 'Bad description');
     sets.push('description = ?', "description_source = 'owner'"); args.push(cleanDescription(body.description));
+  }
+  if (body.speed !== undefined) {
+    sets.push('speed = ?'); args.push(body.speed === null ? null : cleanSpeed(body.speed));
   }
   if (body.keepDays !== undefined) {
     const k = keepDays(body.keepDays, 0);
@@ -625,6 +631,7 @@ function publicVideo(v, url, owner = false) {
     layout: parseJson(v.layout, null) || (v.cam_mime ? DEFAULT_LAYOUT : { kind: 'screen', corner: 'bl', size: 'm' }),
     cuts: parseJson(v.cuts, []),
     description: v.description || '',
+    speed: typeof v.speed === 'number' ? v.speed : null,
     createdAt: v.created_at,
   };
   if (!owner && v.cam_mime && camHidden(v)) Object.assign(out, { hasCam: false, hasCamThumb: false, camMime: null });
@@ -669,6 +676,12 @@ function isDefaultTitle(t) { return /^Recording · /.test(String(t || '')); }
 function cleanDescription(d) { return String(d || '').replace(/\r\n?/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, 1000); }
 
 // null = keep forever; else whole days within [min, 3650].
+function cleanSpeed(x) {
+  const n = Number(x);
+  if (!PLAY_SPEEDS.includes(n)) throw new HttpError(400, `Speed must be one of ${PLAY_SPEEDS.join(', ')}`);
+  return n;
+}
+
 function keepDays(x, min) {
   if (x === null || x === undefined || x === 'forever') return null;
   const n = Number(x);

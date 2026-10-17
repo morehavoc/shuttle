@@ -325,6 +325,7 @@ function onStart() {
     audioCtx: tapCtx,
     layout: store.get('layout', null),
     keepDays: store.get('keepDays', 30), // 'forever' or days; changed on any share page
+    speed: store.get('defaultSpeed', null), // the share page's starting speed; changed on any share page
   });
   // Both of these must start synchronously inside the click.
   const displayP = session.requestDisplay();
