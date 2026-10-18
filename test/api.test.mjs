@@ -500,7 +500,11 @@ try {
     const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
     let n = 0;
     for (let off = 0; off < file.length; off += PART) await call(`/api/videos/${c.id}/parts/${++n}`, { method: 'PUT', body: new Uint8Array(file.subarray(off, off + PART)) });
-    assert.equal((await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { durationMs: 20000, width: 1280, height: 720, mime: 'video/mp4' } })).status, 200);
+    const done = await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { durationMs: 20000, width: 1280, height: 720, mime: 'video/mp4' } });
+    assert.equal(done.status, 200);
+    // "complete" waits for the index, so the share page opened next already has it.
+    assert.deepEqual((await j(done)).ix, { main: 1, cam: 0 }, 'indexed before complete answered');
+    assert.match(await (await call(`/v/${c.id}`, { anon: true })).text(), /"ix":\{"main":1,"cam":0\}/);
     let len = 0;
     for (let i = 0; i < 60 && len !== expected.length; i++) {
       len = Number((await call(`/raw/${c.id}`, { method: 'HEAD', anon: true })).headers.get('content-length'));
@@ -537,6 +541,8 @@ try {
     for (let i = 0; i < 3; i++) await (await call(`/raw/${c.id}`, { anon: true, headers: { Range: 'bytes=0-99' } })).arrayBuffer();
     await new Promise((res) => setTimeout(res, 1500));
     assert.equal(Number((await call(`/raw/${c.id}`, { method: 'HEAD', anon: true })).headers.get('content-length')), file.length, 'viewers served it as stored, unindexed');
+    // A page opened now asks for the file as stored, and keeps doing so after the index lands.
+    assert.match(await (await call(`/v/${c.id}`, { anon: true })).text(), /"ix":\{"main":0,"cam":0\}/);
     assert.equal((await call('/__scheduled?cron=0+*+*+*+*', { anon: true })).status, 200);
     len = 0;
     for (let i = 0; i < 60 && len !== expected.length; i++) {
@@ -544,6 +550,12 @@ try {
       if (len !== expected.length) await new Promise((res) => setTimeout(res, 100));
     }
     assert.equal(len, expected.length, 'the hourly job indexed it');
+    r = await call(`/raw/${c.id}?ix=0`, { anon: true, headers: { Range: `bytes=${at}-${at + 99}` } });
+    assert.equal(r.headers.get('content-range'), `bytes ${at}-${at + 99}/${file.length}`, 'ix=0: the stored size');
+    assert.doesNotMatch(r.headers.get('etag'), /-x"$/);
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(file.subarray(at, at + 100)), 'ix=0: the stored bytes, not shifted by the index');
+    r = await call(`/raw/${c.id}?ix=1`, { anon: true, headers: { Range: `bytes=${at}-${at + 99}` } });
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(expected.subarray(at, at + 100)), 'ix=1: the indexed file');
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 

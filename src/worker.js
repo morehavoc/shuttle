@@ -26,6 +26,7 @@ const MAX_JSON = 1024 * 1024; // the largest edit (5,000 cuts) is ~100 KB
 const MAX_LOGIN_JSON = 4096;
 const MAX_THUMB = 2 * 1024 * 1024;
 const INDEX_TRIES = 3; // fragment-index builds per file before giving up (a build can be killed)
+const INDEX_WAIT_MS = 15000; // how long "complete" waits for the fragment index before answering
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ALLOWED_MIME = /^video\/(webm|mp4|x-matroska|quicktime)(;.*)?$/i;
 const ID = '([A-Za-z0-9]{6,32})';
@@ -332,7 +333,12 @@ async function completeVideo(request, env, ctx, id, url) {
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
   ]);
   ctx.waitUntil(maybeDescribe(env, id)); // in case the transcript finished first
-  ctx.waitUntil(indexTrack(env, id, 'main').then(() => cam && indexTrack(env, id, 'cam')));
+  // The fast-start index, before answering: the share page he lands on next then starts at once
+  // with it. One that outlasts the wait (a very long recording) finishes in the background, and
+  // that page keeps playing the file as it first got it (rawVideo's `ix`).
+  const indexed = Promise.all([indexTrack(env, id, 'main'), cam ? indexTrack(env, id, 'cam') : null]);
+  ctx.waitUntil(indexed);
+  await Promise.race([indexed, new Promise((r) => setTimeout(r, Number(env.INDEX_WAIT_MS) || INDEX_WAIT_MS))]);
   return json({ ...publicVideo(await getVideo(env, id), url, true), truncated: main.truncated || !!(cam && cam.truncated) });
 }
 
@@ -647,8 +653,11 @@ async function rawVideo(request, env, ctx, id, track, url) {
   // The fragment index (see mp4index.js), spliced in at `at`. Built when the recording completes;
   // a file without one (an older recording) is served as stored until the hourly job indexes it.
   // Never built here: a viewer's request must not set off work.
+  // `?ix=0` is a page that opened before the index existed (publicVideo's `ix`): it keeps the
+  // file as stored. Splicing in the index mid-view shifts every byte after it, and Chrome's
+  // player fails each later range request with a decode error until the page is reloaded.
   const idx = (parseJson(v.mp4_index, {}) || {})[track];
-  const fresh = idx && idx.etag === head.etag;
+  const fresh = idx && idx.etag === head.etag && url.searchParams.get('ix') !== '0';
   const sidx = fresh && idx.sidx ? b64decode(idx.sidx) : null;
   const at = sidx ? idx.at : 0;
   const insert = sidx ? sidx.length : 0;
@@ -759,6 +768,8 @@ async function indexTrack(env, id, track) {
       console.error(`index ${k}:`, e && e.message);
       entry = { pending: true, etag: head.etag, tries, since: Date.now(), error: String(e && e.message || e).slice(0, 200) };
     }
+    // Tests only: an index that lands late, as a long recording's does on Cloudflare.
+    if (env.INDEX_DELAY_MS) await new Promise((r) => setTimeout(r, Number(env.INDEX_DELAY_MS)));
     await storeIndex(env, id, track, entry, claim);
     return true;
   } catch (e) {
@@ -871,6 +882,12 @@ function publicVideo(v, url, owner = false) {
     speed: typeof v.speed === 'number' ? v.speed : null,
     createdAt: v.created_at,
   };
+  // Which files had the fast-start index when this was read: a page asks for the file the same
+  // way for as long as it is open (rawVideo), even if the index lands in the meantime.
+  if (v.mp4_index !== undefined) {
+    const idx = parseJson(v.mp4_index, null) || {};
+    out.ix = { main: idx.main && idx.main.sidx ? 1 : 0, cam: idx.cam && idx.cam.sidx ? 1 : 0 };
+  }
   if (!owner && v.cam_mime && camHidden(v)) Object.assign(out, { hasCam: false, hasCamThumb: false, camMime: null });
   if (owner) {
     Object.assign(out, {

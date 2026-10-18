@@ -26,6 +26,14 @@ const pref = {
   set(k, v) { try { localStorage.setItem('shuttle.' + k, JSON.stringify(v)); } catch {} },
 };
 
+// A recording's file, asked for the way this page first saw it: a page that opened before the
+// server added the fast-start index keeps getting the file without it, so its bytes never move
+// under a playing video (see the server's rawVideo).
+export function rawUrl(v, track = 'main') {
+  const ix = v.ix ? `?ix=${v.ix[track] ? 1 : 0}` : '';
+  return `/raw/${v.id}${track === 'cam' ? '/cam' : ''}${ix}`;
+}
+
 export class Player extends EventTarget {
   constructor(host, { video, ownerName = '', owner = false }) {
     super();
@@ -53,14 +61,14 @@ export class Player extends EventTarget {
       class: 'sp-main', playsinline: true, preload: 'metadata', controlslist: 'nodownload noplaybackrate', disablepictureinpicture: true,
       poster: v.hasThumb ? `/thumb/${v.id}.jpg${v.rev ? `?v=${v.rev}` : ''}` : null,
     });
-    this.main.src = `/raw/${v.id}`;
+    this.main.src = rawUrl(v, 'main');
     this.mainWrap = h('div', { class: 'sp-main-wrap' }, this.main);
 
     if (this.hasCam) {
       this.cam = h('video', { class: 'sp-cam', playsinline: true, muted: true, preload: 'auto', disablepictureinpicture: true,
         poster: v.hasCamThumb ? `/thumb/${v.id}/cam.jpg` : null });
       this.cam.muted = true;
-      this.cam.src = `/raw/${v.id}/cam`;
+      this.cam.src = rawUrl(v, 'cam');
       this.camWrap = h('div', { class: 'sp-cam-wrap' }, this.cam, ownerName ? h('span', { class: 'sp-name' }, ownerName) : null);
     }
     this.caption = h('div', { class: 'sp-caption', hidden: true }, h('span'));

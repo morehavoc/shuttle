@@ -1,5 +1,5 @@
 import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
-import { Player } from './player.js';
+import { Player, rawUrl } from './player.js';
 import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
   toSource, withTrim,
@@ -329,8 +329,8 @@ async function takeThumbs(job) {
       if (el.readyState < 2) await mediaEvent(el, 'loadeddata');
       return el;
     };
-    const main = await frame(`/raw/${v.id}`, t);
-    const cam = player.cam ? await frame(`/raw/${v.id}/cam`, t - (v.camOffsetMs || 0) / 1000) : null;
+    const main = await frame(rawUrl(v, 'main'), t);
+    const cam = player.cam ? await frame(rawUrl(v, 'cam'), t - (v.camOffsetMs || 0) / 1000) : null;
     const camera = v.mode === 'camera';
     const thumbs = await makeThumbs({ screenVideo: camera ? null : main, cameraVideo: camera ? main : cam, mode: v.mode, layout: player.hasCam ? player.layout : null });
     for (const [variant, blob] of Object.entries(thumbs)) {
