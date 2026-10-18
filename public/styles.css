@@ -155,6 +155,8 @@ a { color: inherit; }
 }
 .preview .screen-hint { color: #cfc9bf; font-size: 13px; display: grid; justify-items: center; gap: 8px; }
 .preview .screen-hint svg { width: 34px; height: 34px; opacity: .7; }
+/* Clear of the camera bubble in the corner, so it doesn't sit on the words. */
+.preview:has(> .bubble) .screen-hint { margin-left: calc(30% + 14px); text-align: center; }
 .preview video.cam-full { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
 .preview .bubble {
   position: absolute; left: 14px; bottom: 14px; width: 30%; aspect-ratio: 1; border-radius: 50%; overflow: hidden;

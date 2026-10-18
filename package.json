@@ -2,6 +2,9 @@
   "name": "shuttle",
   "private": true,
   "version": "0.1.0",
+  "description": "Record your screen and camera, get a link. A small Loom clone on Cloudflare Workers, R2 and D1.",
+  "license": "MIT",
+  "author": "Christopher Moravec",
   "type": "module",
   "scripts": {
     "dev": "wrangler d1 migrations apply shuttle --local --env local && wrangler dev --env local",
