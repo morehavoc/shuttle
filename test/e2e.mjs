@@ -590,6 +590,23 @@ try {
   const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
   check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
 
+  // The served files carry a fragment index (sidx) so Chrome starts them in one or two
+  // requests instead of reading every fragment first (built in the background after complete).
+  {
+    const hasIndex = async (track) => {
+      for (let i = 0; i < 50; i++) {
+        const buf = Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`, { headers: { Range: 'bytes=0-8191' } })).body());
+        if (buf.includes(Buffer.from('sidx'))) return true;
+        await page.waitForTimeout(100);
+      }
+      return false;
+    };
+    const tracks = meta.hasCam ? ['', '/cam'] : [''];
+    const found = [];
+    for (const t of tracks) found.push(await hasIndex(t));
+    check(found.every(Boolean), `served file${tracks.length > 1 ? 's carry' : ' carries'} a fragment index`, `no fragment index: ${JSON.stringify(found)}`);
+  }
+
   // ---------- what a viewer sees ----------
   const vctx = await newContext();
   const vpage = await vctx.newPage();
@@ -604,6 +621,19 @@ try {
   await vpage.click('.sp-speed-menu button[data-speed="1.5"]');
   const vPicked = await vpage.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, menu: document.querySelector('.sp-speed-menu').hidden, label: document.querySelector('.sp-speed').textContent }));
   check(vPicked.rate === 1.5 && vPicked.menu && vPicked.label === '1.5×', 'viewer changes speed from the menu', `viewer speed menu: ${JSON.stringify(vPicked)}`);
+  // The control-bar Pause at human speed (press, hold, release): it used to do nothing while
+  // playing, because the icon under the pointer was swapped every frame.
+  const humanClick = async (sel) => {
+    const box = await vpage.locator(sel).boundingBox();
+    await vpage.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await vpage.mouse.down(); await vpage.waitForTimeout(150); await vpage.mouse.up();
+    await vpage.waitForTimeout(300);
+    return vpage.evaluate(() => document.querySelector('.sp-main').paused);
+  };
+  await vpage.hover('.sp');
+  const pausedByButton = await humanClick('.sp-controls .sp-btn >> nth=0');
+  const playedByButton = !(await humanClick('.sp-controls .sp-btn >> nth=0'));
+  check(pausedByButton && playedByButton, 'control-bar Pause and Play work at human click speed', `pause button: paused=${pausedByButton}, played again=${playedByButton}`);
   await vpage.waitForSelector('.tc-body .w', { timeout: 15000 }).catch(() => {});
   const viewer = await vpage.evaluate(() => ({
     download: !!Array.from(document.querySelectorAll('button, a')).find((b) => /Download/.test(b.textContent)),

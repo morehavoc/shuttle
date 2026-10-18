@@ -10,6 +10,7 @@ import { renderSharePage, renderNotFound } from './share-page.js';
 import { transcribeWav, provider } from './transcribe.js';
 import { draftDescription, describeProvider } from './describe.js';
 import { normalizeCuts, isWordCut } from '../public/timeline.js';
+import { buildSidx, spliceRanges } from './mp4index.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
 const SESSION_DAYS = 90;
@@ -72,7 +73,7 @@ async function route(request, env, ctx) {
 
   // Public reads (the id is the capability).
   if (match(new RegExp(`^/v/${ID}/?$`)) && method === 'GET') return sharePage(request, env, m[1]);
-  if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, m[1], m[2] || 'main', url);
+  if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, ctx, m[1], m[2] || 'main', url);
   if (match(new RegExp(`^/thumb/${ID}(?:/(cam|og))?(?:\\.jpg)?$`)) && method === 'GET') return thumb(request, env, m[1], m[2] || 'poster');
   if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(env, m[1]);
   if (match(new RegExp(`^/api/videos/${ID}/view$`)) && method === 'POST') return countView(request, env, m[1]);
@@ -280,6 +281,7 @@ async function completeVideo(request, env, ctx, id, url) {
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
   ]);
   ctx.waitUntil(maybeDescribe(env, id)); // in case the transcript finished first
+  ctx.waitUntil(indexTrack(env, id, 'main').then(() => cam && indexTrack(env, id, 'cam')));
   return json({ ...publicVideo(await getVideo(env, id), url, true), truncated: main.truncated || !!(cam && cam.truncated) });
 }
 
@@ -524,8 +526,8 @@ async function sharePage(request, env, id) {
   return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
 }
 
-async function rawVideo(request, env, id, track, url) {
-  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at FROM videos WHERE id = ?').bind(id).first();
+async function rawVideo(request, env, ctx, id, track, url) {
+  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at, mp4_index FROM videos WHERE id = ?').bind(id).first();
   if (!v || v.status !== 'ready' || expired(v)) return new Response('Not found', { status: 404 });
   const download = [...url.searchParams.keys()].some((k) => k.toLowerCase() === 'download');
   if (download && !(await isOwner(request, env))) return new Response('Downloads are for the owner', { status: 403 });
@@ -535,11 +537,19 @@ async function rawVideo(request, env, id, track, url) {
   const head = await env.VIDEOS.head(key);
   if (!head) return new Response('Not found', { status: 404 });
   const mime = (track === 'cam' ? v.cam_mime : v.mime) || head.httpMetadata?.contentType || 'video/mp4';
-  const size = head.size;
+  // The fragment index (see mp4index.js), spliced in at `at`. Built once per file; a file
+  // that hasn't been indexed yet is served as stored and indexed in the background.
+  const idx = (parseJson(v.mp4_index, {}) || {})[track];
+  const fresh = idx && idx.etag === head.etag;
+  if (!fresh && /mp4/.test(mime)) ctx.waitUntil(indexTrack(env, id, track));
+  const sidx = fresh && idx.sidx ? b64decode(idx.sidx) : null;
+  const at = sidx ? idx.at : 0;
+  const insert = sidx ? sidx.length : 0;
+  const size = head.size + insert;
   const headers = new Headers({
     'Content-Type': mime,
     'Accept-Ranges': 'bytes',
-    'ETag': head.httpEtag,
+    'ETag': sidx ? `"${head.etag}-x"` : head.httpEtag,
     // The camera can be hidden from viewers at any time (and the owner still gets it then), so
     // no cache may keep it or serve it without asking again.
     'Cache-Control': download ? 'private, no-store' : track === 'cam' ? 'private, no-cache' : 'public, max-age=300',
@@ -559,18 +569,80 @@ async function rawVideo(request, env, id, track, url) {
     headers.set('Content-Length', String(size));
     return new Response(null, { status: 200, headers });
   }
-  if (range) {
-    const obj = await env.VIDEOS.get(key, { range: { offset: range.start, length: range.end - range.start + 1 } });
+  const start = range ? range.start : 0, end = range ? range.end : size - 1;
+  const len = end - start + 1;
+  let body;
+  if (!sidx) {
+    const obj = await env.VIDEOS.get(key, range ? { range: { offset: start, length: len } } : undefined);
     if (!obj) return new Response('Not found', { status: 404 });
-    headers.set('Content-Range', `bytes ${range.start}-${range.end}/${size}`);
-    headers.set('Content-Length', String(range.end - range.start + 1));
-    return new Response(obj.body, { status: 206, headers });
+    body = obj.body;
+  } else {
+    body = splicedBody(env, ctx, key, spliceRanges(start, end, at, insert), sidx, len);
   }
-  const obj = await env.VIDEOS.get(key);
-  if (!obj) return new Response('Not found', { status: 404 });
-  headers.set('Content-Length', String(size));
-  return new Response(obj.body, { status: 200, headers });
+  headers.set('Content-Length', String(len));
+  if (range) headers.set('Content-Range', `bytes ${start}-${end}/${size}`);
+  return new Response(body, { status: range ? 206 : 200, headers });
 }
+
+// Streams the stored file's byte ranges with the index bytes between them, at a fixed length.
+function splicedBody(env, ctx, key, pieces, sidx, len) {
+  let i = 0, reader = null;
+  const source = new ReadableStream({
+    async pull(ctrl) {
+      for (;;) {
+        if (reader) {
+          const { done, value } = await reader.read();
+          if (!done) { ctrl.enqueue(value); return; }
+          reader = null;
+        }
+        if (i >= pieces.length) { ctrl.close(); return; }
+        const p = pieces[i++];
+        if (p.from === 'sidx') { ctrl.enqueue(sidx.slice(p.offset, p.offset + p.length)); return; }
+        const obj = await env.VIDEOS.get(key, { range: { offset: p.offset, length: p.length } });
+        if (!obj) { ctrl.error(new Error('Video data is missing')); return; }
+        reader = obj.body.getReader();
+      }
+    },
+    cancel(reason) { if (reader) reader.cancel(reason).catch(() => {}); },
+  });
+  const fixed = new FixedLengthStream(len);
+  ctx.waitUntil(source.pipeTo(fixed.writable).catch(() => {})); // a viewer seeking cancels mid-way
+  return fixed.readable;
+}
+
+const indexing = new Set();
+async function indexTrack(env, id, track) {
+  const k = `${id}:${track}`;
+  if (indexing.has(k)) return;
+  indexing.add(k);
+  try {
+    const key = videoKey(id, track);
+    const head = await env.VIDEOS.head(key);
+    if (!head) return;
+    const read = async (offset, length) => {
+      const obj = await env.VIDEOS.get(key, { range: { offset, length } });
+      if (!obj) throw new Error('range read failed');
+      return new Uint8Array(await obj.arrayBuffer());
+    };
+    let entry;
+    try {
+      const r = await buildSidx(read, head.size);
+      entry = r ? { at: r.at, etag: head.etag, sidx: b64encode(r.sidx) } : { none: true, etag: head.etag };
+    } catch (e) {
+      console.error(`index ${k}:`, e && e.message);
+      entry = { none: true, etag: head.etag, error: String(e && e.message || e).slice(0, 200) };
+    }
+    await env.DB.prepare(`UPDATE videos SET mp4_index = json_set(COALESCE(mp4_index, '{}'), '$.' || ?, json(?)) WHERE id = ?`)
+      .bind(track, JSON.stringify(entry), id).run();
+  } catch (e) {
+    console.error(`index ${k}:`, e && e.message);
+  } finally {
+    indexing.delete(k);
+  }
+}
+
+function b64encode(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
+function b64decode(str) { const s = atob(str); const out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; }
 
 async function thumb(request, env, id, variant) {
   const v = await env.DB.prepare('SELECT layout, expires_at FROM videos WHERE id = ?').bind(id).first();

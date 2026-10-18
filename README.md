@@ -79,6 +79,7 @@ npm run dev                                       # migrations + wrangler dev --
 src/worker.js        API, auth, range-served video, thumbnails, transcript chunks
 src/transcribe.js    Whisper providers, picking the trustworthy result, snapping words to the audio
 src/share-page.js    server-rendered share page (Open Graph tags)
+src/mp4index.js      fragment index (sidx) spliced into served MP4s so Chrome starts them at once
 public/app.js        library, setup sheet, recording flow
 public/recorder.js   capture, MediaRecorder ×2, part uploader, transcript tap, thumbnails
 public/pcm-tap.js    AudioWorklet: 16 kHz PCM for the transcript

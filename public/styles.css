@@ -358,7 +358,8 @@ a { color: inherit; }
 .sp-btn:hover { background: rgba(255, 255, 255, .14); }
 .sp-btn svg { width: 20px; height: 20px; }
 .sp-btn[aria-pressed="true"] { color: var(--accent-2); }
-.sp-speed { width: auto; padding: 0 8px; font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; }
+.sp-btn svg, .sp-big svg { pointer-events: none; } /* the click always lands on the button itself */
+.sp-speed { width: auto; height: 28px; padding: 0 9px; margin: 0 2px; font-weight: 700; font-size: 13px; font-variant-numeric: tabular-nums; border: 1.5px solid rgba(255, 255, 255, .55); border-radius: 999px; }
 .sp-speed-wrap { position: relative; flex: none; }
 .sp-speed-menu {
   position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 5; display: grid; padding: 4px; min-width: 76px;

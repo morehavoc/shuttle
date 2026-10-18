@@ -324,8 +324,13 @@ export class Player extends EventTarget {
   ui() {
     const m = this.main;
     const playing = !m.paused && !this.ended;
-    this.playBtn.innerHTML = playing ? ico.pause : ico.play;
-    this.playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    // Only when it changes: ui() runs every frame while playing, and swapping the icon under
+    // the pointer between mouse-down and mouse-up swallowed the click (Pause did nothing).
+    if (this.shownPlaying !== playing) {
+      this.shownPlaying = playing;
+      this.playBtn.innerHTML = playing ? ico.pause : ico.play;
+      this.playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    }
     const total = this.editedDuration;
     const cur = Math.min(total, toEdited(m.currentTime, this.cuts));
     const label = `${fmtDuration(cur * 1000)} / ${fmtDuration(total * 1000)}`;
