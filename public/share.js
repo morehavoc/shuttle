@@ -43,6 +43,17 @@ if (navigator.share && /iPhone|iPad|Android/i.test(navigator.userAgent)) {
 
 if (owner) {
   $('#top-actions').append(h('a', { class: 'btn', href: '/' }, 'Library'));
+  // For a site that won't turn a pasted link into a player (or a Ghost HTML card).
+  // Fetched up front: Safari only lets a click copy if nothing is awaited first.
+  if (v.status === 'ready') {
+    const embedP = api(`/oembed?format=json&url=${encodeURIComponent(shareUrl)}`).catch(() => null);
+    let embedHtml = null;
+    embedP.then((o) => { embedHtml = o && o.html; });
+    actions.append(h('button', { class: 'btn', type: 'button', id: 'copy-embed', onclick: async () => {
+      if (!embedHtml) return toast('Embed code isn’t ready yet', { bad: true });
+      toast((await copyText(embedHtml)) ? 'Embed code copied' : 'Couldn’t copy', {});
+    } }, 'Copy embed code'));
+  }
   if (v.status === 'ready') {
     const dl = h('div', { class: 'menu-wrap' });
     const menu = h('div', { class: 'menu', hidden: true },

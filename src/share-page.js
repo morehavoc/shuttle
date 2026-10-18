@@ -35,6 +35,7 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
 <meta name="twitter:image" content="${esc(ogImage)}">` : ''}
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="${esc(v.title)}">
+<link rel="alternate" type="application/json+oembed" href="${esc(`${origin}/oembed?format=json&url=${encodeURIComponent(page)}`)}" title="${esc(v.title)}">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.bunny.net"><link rel="stylesheet" href="https://fonts.bunny.net/css?family=fira-sans:500,600,700|noto-sans:400,700|jetbrains-mono:400,500&display=swap">
 <link rel="stylesheet" href="/styles.css">
@@ -66,6 +67,33 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script type="application/json" id="shuttle-data">${data}</script>
 <script src="/share.js" type="module"></script>
+</body>
+</html>`;
+}
+
+// The player alone, for an <iframe> on another site (a Ghost post, say). Always rendered for a
+// viewer: an embed is the share link in another frame, and nothing on it edits the video.
+export function renderEmbedPage(v, { origin, ownerName }) {
+  const data = JSON.stringify({ video: v, ownerName }).replace(/</g, '\\u003c');
+  const ready = v.status === 'ready';
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(v.title)}${ownerName ? ` · ${esc(ownerName)}` : ''}</title>
+<meta name="robots" content="noindex">
+<link rel="canonical" href="${esc(`${origin}/v/${v.id}`)}">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.bunny.net"><link rel="stylesheet" href="https://fonts.bunny.net/css?family=fira-sans:500,600,700|noto-sans:400,700|jetbrains-mono:400,500&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body class="embed">
+<div class="player-host" id="player-host">
+  ${ready ? '' : `<div class="player-pending"><p>This video is still uploading.</p></div>`}
+</div>
+<script type="application/json" id="shuttle-data">${data}</script>
+${ready ? '<script src="/embed.js" type="module"></script>' : ''}
 </body>
 </html>`;
 }
