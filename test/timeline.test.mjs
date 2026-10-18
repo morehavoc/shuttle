@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {
   normalizeCuts, addCut, removeCut, keepSegments, editedDuration, toEdited, toSource, cutAt,
-  wordRange, isWordCut, fillerCuts, pauseCuts, captionLines, isFiller, paragraphs,
+  wordRange, isWordCut, fillerCuts, pauseCuts, captionLines, isFiller, paragraphs, trimCuts, withTrim,
 } from '../public/timeline.js';
 
 let n = 0, failed = 0;
@@ -23,6 +23,20 @@ t('keep segments are the complement', () => {
   assert.deepEqual(keepSegments([[1, 2], [5, 6]], 10), [[0, 1], [2, 5], [6, 10]]);
   assert.deepEqual(keepSegments([[0, 2], [8, 10]], 10), [[2, 8]]);
   assert.deepEqual(keepSegments([], 10), [[0, 10]]);
+});
+t('keep segments drop rounding slivers at the start and end', () => {
+  assert.deepEqual(keepSegments([[0, 2], [8, 9.315]], 9.31533), [[2, 8]]); // trim to the end, stored to the ms
+  assert.deepEqual(keepSegments([[0.02, 3]], 10), [[3, 10]]);
+  assert.deepEqual(keepSegments([], 0.02), [[0, 0.02]]); // a whole (tiny) video still plays
+  near(toSource(6, [[0, 2], [8, 9.315]], 9.31533), 8);
+});
+t('trim: start and end as cuts, the end reaching any length', () => {
+  assert.deepEqual(trimCuts(null), []);
+  assert.deepEqual(trimCuts({ start: 0, end: null }), []);
+  assert.deepEqual(withTrim([[3, 4]], { start: 2, end: 8 }, 9.4), [[0, 2], [3, 4], [8, 9.4]]);
+  assert.deepEqual(withTrim([[3, 4]], { start: 2, end: 8 }, 9.784), [[0, 2], [3, 4], [8, 9.784]]); // a longer read of the same file
+  assert.deepEqual(withTrim([[1.5, 2.5]], { start: 2, end: null }, 10), [[0, 2.5]]); // merged for playback only
+  assert.deepEqual(keepSegments(withTrim([], { start: 2, end: 8 }, 9.31533), 9.31533), [[2, 8]]);
 });
 t('edited duration', () => {
   near(editedDuration([[1, 2], [5, 6]], 10), 8);

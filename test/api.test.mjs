@@ -287,7 +287,7 @@ try {
     assert.ok(og.equals(poster), 'link preview is the plain poster');
     const html = await (await call(`/v/${id}`, { anon: true })).text();
     assert.match(html, /"hasCam":false/);
-    assert.match(html, /og\.jpg\?l=s"/);
+    assert.match(html, /og\.jpg\?l=s&amp;v=\d+"/);
     assert.doesNotMatch(html, /class="avatar" src=/);
     const page = await (await call(`/v/${id}`)).text();
     assert.match(page, /"hasCam":true/, 'owner page keeps the camera to switch back');
@@ -313,10 +313,34 @@ try {
     assert.equal((await call(`/api/videos/${id}`, { method: 'PATCH', body: { cuts: 'nope' } })).status, 400);
   });
 
+  await test('trim: stored apart from the cuts; viewers never get trimmed words; bad trims refused', async () => {
+    const all = await j(await call(`/api/videos/${id}/transcript`));
+    const cutsBefore = (await j(await call(`/api/videos/${id}`))).cuts;
+    const first = all.words[0], last = all.words[all.words.length - 1];
+    const ms = (x) => Math.round(x * 1000) / 1000;
+    let r = await call(`/api/videos/${id}`, { method: 'PATCH', body: { trim: { start: first.e + 0.01, end: last.s - 0.01 } } });
+    let v = await j(r);
+    assert.equal(r.status, 200);
+    assert.deepEqual(v.trim, { start: ms(first.e + 0.01), end: ms(last.s - 0.01) });
+    assert.deepEqual(v.cuts, cutsBefore, 'the cuts are untouched');
+    const viewer = await j(await call(`/api/videos/${id}/transcript`, { anon: true }));
+    assert.ok(!viewer.words.some((x) => x.s === first.s || x.s === last.s), 'trimmed words never reach viewers');
+    assert.ok(viewer.words.length >= 1);
+    assert.match(await (await call(`/v/${id}`, { anon: true })).text(), /"trim":\{"start":/);
+    v = await j(await call(`/api/videos/${id}`, { method: 'PATCH', body: { trim: { start: 1, end: null } } }));
+    assert.deepEqual(v.trim, { start: 1, end: null }, 'no end: plays to the end');
+    for (const bad of ['x', [1, 2], { start: -1 }, { start: 2, end: 2.2 }, { start: 'a' }, { end: 1e9 }, { start: 1e9 }]) {
+      assert.equal((await call(`/api/videos/${id}`, { method: 'PATCH', body: { trim: bad } })).status, 400, JSON.stringify(bad));
+    }
+    v = await j(await call(`/api/videos/${id}`, { method: 'PATCH', body: { trim: null } }));
+    assert.equal(v.trim, null);
+    assert.equal((await j(await call(`/api/videos/${id}/transcript`, { anon: true }))).words.length, viewer.words.length + 2, 'untrimmed: both words back');
+  });
+
   await test('share page: link-preview tags, escaped title, owner flag, no owner-only fields for viewers', async () => {
     await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: 'Hello <script>alert(1)</script> & "q"' } });
     const html = await (await call(`/v/${id}`, { anon: true })).text();
-    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\/[A-Za-z0-9]+\/og\.jpg\?l=c"/);
+    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\/[A-Za-z0-9]+\/og\.jpg\?l=c&amp;v=\d+"/);
     assert.doesNotMatch(html, /og:video/);
     assert.match(html, /Hello &lt;script&gt;alert\(1\)&lt;\/script&gt; &amp; &quot;q&quot;/);
     assert.doesNotMatch(html, /<script>alert/);

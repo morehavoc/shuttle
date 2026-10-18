@@ -37,7 +37,10 @@ export function removeCut(cuts, [s, e], duration) {
   return normalizeCuts(out, duration);
 }
 
-// The parts that play: complement of the cuts inside [0, duration].
+// The parts that play: complement of the cuts inside [0, duration]. Slivers left between a cut
+// and the start or end are dropped: cuts are stored to the millisecond, so a trim to the end
+// of a 9.31533 s file stops at 9.315 and would otherwise leave a third of a millisecond
+// "playing" after it (and Play, finding it, would not start over from the beginning).
 export function keepSegments(cuts, duration) {
   const segs = [];
   let t = 0;
@@ -46,7 +49,26 @@ export function keepSegments(cuts, duration) {
     t = Math.max(t, e);
   }
   if (duration > t) segs.push([t, duration]);
-  return segs;
+  const real = segs.filter(([s, e]) => e - s >= MIN_CUT);
+  return real.length ? real : segs;
+}
+
+// The trim, { start, end } in seconds of the recording (end null: to the end), as cuts. The end
+// cut runs past any length, and normalizeCuts clamps it to the length at hand: browsers read
+// the same file's length differently (by up to half a second), so a stored end of the file
+// would leave a Safari viewer a piece of what was trimmed.
+export const TRIM_END = 1e7;
+export function trimCuts(trim) {
+  const out = [];
+  if (!trim) return out;
+  if (trim.start > 0) out.push([0, trim.start]);
+  if (typeof trim.end === 'number' && Number.isFinite(trim.end)) out.push([trim.end, TRIM_END]);
+  return out;
+}
+
+// What playback skips: the cuts and the trim together.
+export function withTrim(cuts, trim, duration = Infinity) {
+  return normalizeCuts([...(cuts || []), ...trimCuts(trim)], duration);
 }
 
 export function editedDuration(cuts, duration) {

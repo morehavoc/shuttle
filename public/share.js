@@ -2,6 +2,7 @@ import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
 import { Player } from './player.js';
 import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
+  withTrim,
 } from './timeline.js';
 
 const { video: v, owner, ownerName } = JSON.parse(document.getElementById('shuttle-data').textContent);
@@ -12,13 +13,20 @@ if (params.has('new')) history.replaceState(null, '', `/v/${v.id}`);
 let player = null;
 let words = [];
 let cuts = normalizeCuts(v.cuts || []);
+let trim = cleanTrim(v.trim); // { start, end }: where it starts and stops (end null: the end)
 const duration = () => (player && player.duration) || (v.durationMs || 0) / 1000;
+// What playback skips: the cuts and the trim. They are kept apart so neither edit swallows the other.
+const playCuts = () => withTrim(cuts, trim, duration() || Infinity);
+const hasTrim = () => trim.start > 0 || trim.end !== null;
+function cleanTrim(t) {
+  return { start: t && t.start > 0 ? t.start : 0, end: t && typeof t.end === 'number' ? t.end : null };
+}
 
 // ---------- byline ----------
 function renderWhen() {
   const date = new Date(v.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
   const d = duration();
-  const len = d ? fmtDuration(editedDuration(cuts, d) * 1000) : '';
+  const len = d ? fmtDuration(editedDuration(playCuts(), d) * 1000) : '';
   $('#when').textContent = [date, len].filter(Boolean).join(' · ');
 }
 renderWhen();
@@ -143,7 +151,7 @@ async function exportTogether() {
   document.body.append(box);
   player.pause();
   try {
-    const blob = await exportComposite({ ...v, cuts }, {
+    const blob = await exportComposite({ ...v, cuts: playCuts() }, {
       layout: player.layout, ownerName, signal: ctrl.signal,
       onProgress: (p) => { const pc = Math.round(p * 100); label.textContent = `Making your video… ${pc}%`; bar.firstChild.style.width = `${pc}%`; },
     });
@@ -205,9 +213,130 @@ function ownerPanel() {
     sync();
     parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
   }
+  parts.push(trimRow());
   parts.push(speedRow());
   parts.push(keepRow());
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
+}
+
+// Trim: two handles for where the video starts and stops. Stored apart from the cuts, so a trim
+// never swallows a cut it passes over; Undo, the transcript, viewers and the "with your edits"
+// download follow it.
+let onCutsChanged = null;
+function trimRow() {
+  const MIN = 1; // seconds that must stay between the handles
+  const EDGE = 0.1; // a handle this close to its end is no trim (the slider rounds to its step)
+  const timers = { lo: 0, hi: 0 }; // a handle's save waiting to happen
+  const lo = h('input', { type: 'range', class: 'trim-lo', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim start' });
+  const hi = h('input', { type: 'range', class: 'trim-hi', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim end' });
+  const fill = h('div', { class: 'trim-fill' });
+  const label = h('span', { class: 'row-note trim-label' });
+  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => {
+    for (const k of ['lo', 'hi']) { clearTimeout(timers[k]); timers[k] = 0; } // a move not saved yet goes too
+    setTrim({ start: 0, end: null });
+    sync();
+  } }, 'Reset');
+  const paint = (s, e) => {
+    const d = duration() || 1;
+    fill.style.left = `${(s / d) * 100}%`;
+    fill.style.width = `${Math.max(0, ((e - s) / d) * 100)}%`;
+    label.textContent = `${fmtDuration(s * 1000)} – ${fmtDuration(e * 1000)}`;
+    reset.hidden = s <= EDGE && e >= d - EDGE;
+    // The handles overlap when they are close; the one on top is the one that can still move.
+    lo.classList.toggle('on-top', s + e > d);
+  };
+  // Draws the saved trim. A handle moved but not saved yet keeps its place (its save is on the way).
+  const sync = () => {
+    const d = duration();
+    lo.max = hi.max = String(d);
+    if (!timers.lo) lo.value = String(Math.min(trim.start, d));
+    if (!timers.hi) hi.value = String(trim.end === null ? d : Math.min(trim.end, d));
+    paint(Number(lo.value), Number(hi.value));
+  };
+  lo.addEventListener('input', () => {
+    const e = Number(hi.value), s = Math.max(0, Math.min(Number(lo.value), e - MIN));
+    lo.value = String(s);
+    paint(s, e);
+    player.previewAt(s);
+  });
+  hi.addEventListener('input', () => {
+    const s = Number(lo.value), e = Math.min(duration(), Math.max(Number(hi.value), s + MIN));
+    hi.value = String(e);
+    paint(s, e);
+    player.previewAt(e);
+  });
+  // Saved when let go, or once the arrow keys pause: one Undo step and one toast per adjustment.
+  // Only the handle that moved changes.
+  const later = (k, fn) => { clearTimeout(timers[k]); timers[k] = setTimeout(() => { timers[k] = 0; fn(); }, 300); };
+  lo.addEventListener('change', () => later('lo', () => {
+    const s = Number(lo.value);
+    setTrim({ ...trim, start: s <= EDGE ? 0 : s });
+  }));
+  hi.addEventListener('change', () => later('hi', () => {
+    const e = Number(hi.value);
+    setTrim({ ...trim, end: e >= duration() - EDGE ? null : e });
+  }));
+  function setTrim(next) {
+    // Inside the edge nothing is trimmed yet; the handle stays where it was let go (re-reading
+    // the trim would put it back at the end, and arrow keys could never step out of the edge).
+    if (next.start === trim.start && next.end === trim.end) return;
+    const moved = next.start !== trim.start;
+    apply(cuts, next.start > 0 || next.end !== null ? 'Trimmed' : 'Trim removed', { trim: next });
+    if (moved) retakeThumbs();
+  }
+  onCutsChanged = sync;
+  for (const ev of ['loadedmetadata', 'durationchange']) player.main.addEventListener(ev, sync); // the real length may arrive later
+  sync();
+  return h('div', { class: 'layout-row trim-row' }, h('span', { class: 'row-label' }, 'Trim'),
+    h('div', { class: 'trim' }, h('div', { class: 'trim-rail' }), fill, lo, hi), label, reset);
+}
+
+// The poster and the link preview are taken 3 s into the recording, which is just what a start
+// trim cuts off. Take them again from the new start, from hidden copies of the video so the
+// player doesn't move. Best effort: on any failure the old pictures stay.
+let thumbsJob = 0;
+async function retakeThumbs() {
+  const job = ++thumbsJob;
+  await new Promise((r) => setTimeout(r, 800)); // a run of changes takes one picture
+  if (job !== thumbsJob) return;
+  const els = [];
+  try {
+    const { makeThumbs } = await import('./recorder.js');
+    const end = trim.end === null ? duration() : trim.end;
+    const t = Math.max(0, Math.min(trim.start > 0 ? trim.start + 0.5 : 3, end - 0.2));
+    const frame = async (src, at) => {
+      const el = h('video', { muted: true, playsinline: true, preload: 'auto', class: 'offscreen' });
+      els.push(el);
+      document.body.append(el);
+      el.src = src;
+      await mediaEvent(el, 'loadedmetadata');
+      el.currentTime = Math.max(0, Math.min(at, (Number.isFinite(el.duration) ? el.duration : at) - 0.05));
+      await mediaEvent(el, 'seeked');
+      if (el.readyState < 2) await mediaEvent(el, 'loadeddata');
+      return el;
+    };
+    const main = await frame(`/raw/${v.id}`, t);
+    const cam = player.cam ? await frame(`/raw/${v.id}/cam`, t - (v.camOffsetMs || 0) / 1000) : null;
+    if (job !== thumbsJob) return;
+    const camera = v.mode === 'camera';
+    const thumbs = await makeThumbs({ screenVideo: camera ? null : main, cameraVideo: camera ? main : cam, mode: v.mode, layout: player.hasCam ? player.layout : null });
+    for (const [variant, blob] of Object.entries(thumbs)) {
+      if (!blob || job !== thumbsJob) continue;
+      await fetch(`/api/videos/${v.id}/thumb?variant=${variant}`, { method: 'PUT', body: blob, credentials: 'same-origin' });
+    }
+  } catch (e) {
+    console.warn('thumbnails not retaken:', e && e.message);
+  } finally {
+    for (const el of els) { el.removeAttribute('src'); el.load(); el.remove(); }
+  }
+}
+
+function mediaEvent(el, name, ms = 15000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { el.removeEventListener(name, done); reject(new Error(`no ${name}`)); }, ms);
+    function done() { clearTimeout(t); resolve(); }
+    el.addEventListener(name, done, { once: true });
+  });
 }
 
 const SPEED_CHOICES = [1, 1.2, 1.5, 2];
@@ -256,6 +385,7 @@ let editing = false;
 let undoStack = [];
 let saveTimer = 0;
 let wordEls = [];
+let stamps = []; // paragraph start times: { el, s }
 let activeIdx = -1;
 let toRetry = 0; // chunks the last transcript load said could be tried again
 
@@ -311,16 +441,21 @@ function renderWords() {
   const body = $('#tc-body');
   if (!body) return;
   wordEls = [];
-  const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], cuts));
+  stamps = [];
+  const play = playCuts();
+  const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], play));
   const paras = paragraphs(visible.map((i) => words[i]));
   body.replaceChildren(...paras.map((idxs) => {
     const first = words[visible[idxs[0]]];
-    const p = h('p', { class: 'tc-p' }, h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, cuts)) * 1000)));
+    const ts = h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, play)) * 1000));
+    stamps.push({ el: ts, s: first.s });
+    const p = h('p', { class: 'tc-p' }, ts);
     for (const k of idxs) {
       const i = visible[k];
       const w = words[i];
       const span = h('span', { class: 'w', 'data-i': String(i) }, w.w);
       if (isWordCut(w, cuts)) span.classList.add('cut');
+      else if (isWordCut(w, play)) span.classList.add('trimmed'); // skipped, but not by a cut
       wordEls[i] = span;
       p.append(span, ' ');
     }
@@ -367,9 +502,9 @@ function renderEditTools(tools) {
   const editBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setEditing(!editing) }, 'Edit');
   const extra = h('div', { class: 'tc-edit-tools', hidden: true },
     h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(fillerCuts(words, duration())), 'Filler words removed') }, 'Remove ums'),
-    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(pauseCuts(words, cuts, duration())), 'Pauses shortened') }, 'Shorten pauses'),
+    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(insideTrim(pauseCuts(words, playCuts(), duration()))), 'Pauses shortened') }, 'Shorten pauses'),
     h('button', { class: 'btn btn-sm', type: 'button', id: 'undo', onclick: undo, disabled: true }, 'Undo'),
-    h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], 'All edits removed') }, 'Restore all'),
+    h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], hasTrim() ? 'All cuts restored (the trim stays)' : 'All edits removed') }, 'Restore all'),
   );
   tools.append(extra, editBtn);
   function setEditing(on) {
@@ -382,23 +517,39 @@ function renderEditTools(tools) {
   }
 }
 
+// Pause cuts run from the start or to the end when the silence does; inside a trim they stop at
+// it, so taking the trim off later brings back what only the trim had hidden.
+function insideTrim(ranges) {
+  const end = trim.end === null ? Infinity : trim.end;
+  return ranges.map(([s, e]) => [Math.max(s, trim.start), Math.min(e, end)]).filter(([s, e]) => e > s);
+}
+
 function addAll(ranges) {
   let c = cuts;
   for (const r of ranges) c = addCut(c, r, duration());
   return c;
 }
 
-function apply(next, message, { record = true } = {}) {
+function apply(next, message, { record = true, trim: nextTrim = trim } = {}) {
   if (record) {
-    undoStack.push(cuts);
+    undoStack.push({ cuts, trim });
     if (undoStack.length > 100) undoStack.shift();
   }
   cuts = normalizeCuts(next, duration());
-  player.setCuts(cuts);
-  for (let i = 0; i < words.length; i++) if (wordEls[i]) wordEls[i].classList.toggle('cut', isWordCut(words[i], cuts));
+  trim = nextTrim;
+  const play = playCuts();
+  player.setCuts(play);
+  for (let i = 0; i < words.length; i++) {
+    if (!wordEls[i]) continue;
+    const cut = isWordCut(words[i], cuts);
+    wordEls[i].classList.toggle('cut', cut);
+    wordEls[i].classList.toggle('trimmed', !cut && isWordCut(words[i], play));
+  }
+  for (const { el, s } of stamps) el.textContent = fmtDuration(Math.max(0, toEdited(s, play)) * 1000);
   const undoBtn = $('#undo');
   if (undoBtn) undoBtn.disabled = !undoStack.length;
   renderWhen();
+  if (onCutsChanged) onCutsChanged();
   if (message) toast(message);
   clearTimeout(saveTimer);
   saveTimer = setTimeout(save, 400);
@@ -406,12 +557,22 @@ function apply(next, message, { record = true } = {}) {
 
 function undo() {
   if (!undoStack.length) return;
-  apply(undoStack.pop(), 'Undone', { record: false });
+  const prev = undoStack.pop();
+  apply(prev.cuts, 'Undone', { record: false, trim: prev.trim });
 }
 
+// One save at a time, each with the whole edit state as it is when it goes, so a slow save can't
+// land after a newer one (an Undo during a save used to leave the server with what was undone).
+let saving = false, saveAgain = false;
 async function save() {
-  try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts } }); }
-  catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+  if (saving) { saveAgain = true; return; }
+  saving = true;
+  do {
+    saveAgain = false;
+    try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts, trim: hasTrim() ? trim : null } }); }
+    catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+  } while (saveAgain);
+  saving = false;
 }
 
 // One pass over the chunks that need it (the server hands out four at a time, least recently
@@ -456,7 +617,8 @@ function showSelTools() {
   const r = selectedRange();
   if (!r) return;
   const [i, j] = r;
-  const anyKept = words.slice(i, j + 1).some((w) => !isWordCut(w, cuts));
+  const play = playCuts();
+  const anyKept = words.slice(i, j + 1).some((w) => !isWordCut(w, play));
   const anyCut = words.slice(i, j + 1).some((w) => isWordCut(w, cuts));
   const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
   selTools = h('div', { class: 'sel-tools' },
@@ -506,7 +668,7 @@ document.addEventListener('keydown', (e) => {
 // ---------- player (started last, once everything above is defined) ----------
 function init() {
 if (v.status === 'ready') {
-  player = new Player($('#player-host'), { video: v, ownerName, owner });
+  player = new Player($('#player-host'), { video: { ...v, cuts: withTrim(cuts, trim) }, ownerName, owner });
   let counted = owner;
   player.addEventListener('play', () => {
     if (counted) return;

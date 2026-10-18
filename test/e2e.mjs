@@ -547,6 +547,70 @@ try {
   await page.evaluate(() => document.querySelector('.sp-main').pause());
   } // !SPEECH
 
+  // ---------- trim the start and the end ----------
+  // Before the export, so the "with your edits" download is checked against the trim too.
+  const videoNow = async () => (await page.request.get(`${BASE}/api/videos/${meta.id}`)).json();
+  const total = () => page.evaluate(() => { const [m, s] = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number); return m * 60 + s; });
+  let trimStart = 0;
+  const posterNow = async () => Buffer.from(await (await page.request.get(`${BASE}/thumb/${meta.id}.jpg`)).body());
+  const posterBefore = await posterNow();
+  {
+    const cutsBefore = JSON.stringify((await videoNow()).cuts);
+    await page.locator('.trim-row').scrollIntoViewIfNeeded();
+    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
+    const box = await page.locator('.trim').boundingBox();
+    // Drag the start handle a quarter of the way in with the mouse; the player shows that frame.
+    const y = box.y + box.height / 2, x0 = box.x + 7; // centre of the 14 px thumb at 0
+    await page.mouse.move(x0, y);
+    await page.mouse.down();
+    for (let i = 1; i <= 10; i++) await page.mouse.move(x0 + box.width * 0.25 * (i / 10), y);
+    await page.waitForTimeout(300);
+    const during = await page.evaluate(() => ({ t: document.querySelector('.sp-main').currentTime, paused: document.querySelector('.sp-main').paused, lo: Number(document.querySelector('.trim-lo').value), label: document.querySelector('.trim-label').textContent }));
+    await page.mouse.up();
+    await page.waitForTimeout(1200); // saved 0.3 s after letting go, after the 0.4 s save delay
+    trimStart = during.lo;
+    check(during.paused && Math.abs(during.t - during.lo) < 0.15 && during.lo > d * 0.15,
+      `dragging the start handle previews that frame (${during.lo.toFixed(2)} s, "${during.label}")`, `start handle drag: ${JSON.stringify(during)} of ${d}`);
+    let saved = await videoNow();
+    check(saved.trim && Math.abs(saved.trim.start - trimStart) < 0.06 && saved.trim.end === null && JSON.stringify(saved.cuts) === cutsBefore,
+      `start trim saved (${saved.trim && saved.trim.start} s), cuts untouched`, `start trim: ${JSON.stringify(saved.trim)}, cuts ${JSON.stringify(saved.cuts)} (were ${cutsBefore})`);
+    // The end handle from the keyboard: 20 steps of 0.05 s, saved once (one Undo step).
+    await page.focus('.trim-hi');
+    for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(1200);
+    saved = await videoNow();
+    const hiVal = await page.evaluate(() => Number(document.querySelector('.trim-hi').value));
+    check(saved.trim && Math.abs(saved.trim.end - hiVal) < 0.06 && Math.abs(d - hiVal - 1) < 0.15 && Math.abs(saved.trim.start - trimStart) < 0.06 && JSON.stringify(saved.cuts) === cutsBefore,
+      `end trim saved (${saved.trim && saved.trim.end} s, 1 s off the end), start and cuts kept`, `end trim: handle ${hiVal}, trim ${JSON.stringify(saved.trim)}, cuts ${JSON.stringify(saved.cuts)} of ${d}`);
+    if (nWords) {
+      // A run of arrow keys is one Undo step (Undo lives in the transcript's Edit mode).
+      await page.click('.tc-tools >> text=Edit');
+      await page.click('.tc-edit-tools >> text=Undo');
+      await page.waitForTimeout(900);
+      const undone = await videoNow();
+      check(undone.trim && undone.trim.end === null && Math.abs(undone.trim.start - trimStart) < 0.06 && JSON.stringify(undone.cuts) === cutsBefore,
+        'one Undo takes back the whole run of arrow keys', `after Undo: trim ${JSON.stringify(undone.trim)}, cuts ${JSON.stringify(undone.cuts)}`);
+      await page.click('.tc-tools >> text=Done');
+      await page.focus('.trim-hi');
+      for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+      await page.waitForTimeout(1200);
+      saved = await videoNow();
+    }
+    const { editedDuration, withTrim } = await import('../public/timeline.js');
+    const want = editedDuration(withTrim(saved.cuts, saved.trim, d), d), shown = await total();
+    check(Math.abs(shown - want) <= 1, `player length follows the trim (${shown} s)`, `player shows ${shown} s, cuts and trim give ${want.toFixed(2)} s`);
+    if (nWords) {
+      const marks = await page.evaluate(() => ({ trimmed: document.querySelectorAll('.tc-body .w.trimmed').length, cut: document.querySelectorAll('.tc-body .w.cut').length }));
+      check(marks.trimmed > 0 && marks.cut >= 3, `transcript marks trimmed words (${marks.trimmed}) apart from cut ones (${marks.cut})`, `transcript marks: ${JSON.stringify(marks)}`);
+    }
+    // Play starts at the trimmed start.
+    await page.click('.sp-controls .sp-btn >> nth=0');
+    await page.waitForTimeout(200);
+    const t0 = await page.evaluate(() => { const m = document.querySelector('.sp-main'); m.pause(); return m.currentTime; });
+    check(t0 >= trimStart - 0.05 && t0 < trimStart + 1.5, `owner's Play starts at the trimmed start (${t0.toFixed(2)} s)`, `owner played from ${t0}, trim ${trimStart}`);
+    await shot('11b-trim.png');
+  }
+
   // ---------- export: one file, camera burnt in ----------
   if (!SPEECH && (MODE === 'screen-camera' || (await page.evaluate(() => (JSON.parse(document.getElementById('shuttle-data').textContent).video.cuts || []).length)) || true)) {
     const expected = await page.evaluate(() => {
@@ -571,6 +635,16 @@ try {
     }
   }
 
+  // A start trim takes the poster again from the new start (it was taken 3 s in, inside the trim).
+  {
+    let changed = false;
+    for (let i = 0; i < 40 && !changed; i++) {
+      changed = !(await posterNow()).equals(posterBefore);
+      if (!changed) await page.waitForTimeout(500);
+    }
+    check(changed, 'poster taken again from the trimmed start', 'poster unchanged 20 s after the start trim');
+  }
+
   // The stored screen file must decode cleanly end to end (a broken stretch stops Chrome's
   // player dead; see fixedSizeTrack in recorder.js).
   if (MODE !== 'camera' && !FAULT) {
@@ -590,21 +664,37 @@ try {
   const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
   check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
 
-  // The served files carry a fragment index (sidx) so Chrome starts them in one or two
-  // requests instead of reading every fragment first (built in the background after complete).
+  // A served file with more than one fragment carries a fragment index (sidx) in front of the
+  // first, so Chrome starts it in one or two requests instead of reading every fragment first
+  // (built in the background after complete). A short recording can be a single fragment, with
+  // nothing to index; the API test covers the index itself byte for byte.
   {
-    const hasIndex = async (track) => {
+    const topBoxes = (buf) => {
+      const boxes = [];
+      for (let o = 0; o + 8 <= buf.length;) {
+        let size = buf.readUInt32BE(o);
+        if (size === 1) size = Number(buf.readBigUInt64BE(o + 8));
+        else if (size === 0) size = buf.length - o;
+        if (size < 8) break;
+        boxes.push(buf.toString('latin1', o + 4, o + 8));
+        o += size;
+      }
+      return boxes;
+    };
+    const indexState = async (track) => {
+      let boxes = [];
       for (let i = 0; i < 50; i++) {
-        const buf = Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`, { headers: { Range: 'bytes=0-8191' } })).body());
-        if (buf.includes(Buffer.from('sidx'))) return true;
+        boxes = topBoxes(Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`)).body()));
+        const moofs = boxes.filter((b) => b === 'moof').length, at = boxes.indexOf('sidx');
+        if (moofs < 2) return { track: track || 'main', moofs, ok: at < 0 };
+        if (at >= 0) return { track: track || 'main', moofs, ok: boxes[at + 1] === 'moof' };
         await page.waitForTimeout(100);
       }
-      return false;
+      return { track: track || 'main', ok: false, boxes: boxes.slice(0, 6) };
     };
-    const tracks = meta.hasCam ? ['', '/cam'] : [''];
-    const found = [];
-    for (const t of tracks) found.push(await hasIndex(t));
-    check(found.every(Boolean), `served file${tracks.length > 1 ? 's carry' : ' carries'} a fragment index`, `no fragment index: ${JSON.stringify(found)}`);
+    const states = [];
+    for (const t of meta.hasCam ? ['', '/cam'] : ['']) states.push(await indexState(t));
+    check(states.every((x) => x.ok), `served files: fragment index wherever there is more than one fragment (${states.map((x) => `${x.track} ${x.moofs} fragment${x.moofs === 1 ? '' : 's'}`).join(', ')})`, `fragment index: ${JSON.stringify(states)}`);
   }
 
   // ---------- what a viewer sees ----------
@@ -615,6 +705,8 @@ try {
   const vSpeed = await vpage.evaluate(() => document.querySelector('.sp-main, .sp video').playbackRate);
   check(vSpeed === 1.2, 'viewer\'s player starts at the owner\'s speed', `viewer starts at ${vSpeed}`);
   await vpage.click('.sp-big'); // the controls appear once it's playing
+  const vStart = await vpage.evaluate(() => document.querySelector('.sp-main').currentTime);
+  check(vStart >= trimStart - 0.05 && vStart < trimStart + 1, `viewer's video starts at the trimmed start (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}, trim ${trimStart}`);
   await vpage.waitForTimeout(600);
   await vpage.hover('.sp');
   await vpage.click('.sp-speed');
@@ -635,6 +727,7 @@ try {
   const playedByButton = !(await humanClick('.sp-controls .sp-btn >> nth=0'));
   check(pausedByButton && playedByButton, 'control-bar Pause and Play work at human click speed', `pause button: paused=${pausedByButton}, played again=${playedByButton}`);
   await vpage.waitForSelector('.tc-body .w', { timeout: 15000 }).catch(() => {});
+  const ownerKept = await page.evaluate(() => document.querySelectorAll('.tc-body .w:not(.cut):not(.trimmed)').length);
   const viewer = await vpage.evaluate(() => ({
     download: !!Array.from(document.querySelectorAll('button, a')).find((b) => /Download/.test(b.textContent)),
     panel: !document.querySelector('#owner-panel').hidden,
@@ -643,7 +736,7 @@ try {
     words: document.querySelectorAll('.tc-body .w').length,
   }));
   check(!viewer.download && !viewer.panel && !viewer.editable, 'viewer gets no download, layout or rename controls', `viewer controls: ${JSON.stringify(viewer)}`);
-  if (!SPEECH) check(viewer.cut === 0 && viewer.words < nWords, `viewer transcript hides cut words (${viewer.words} of ${nWords})`, `viewer sees cut words: ${JSON.stringify(viewer)}`);
+  if (!SPEECH) check(viewer.cut === 0 && viewer.words === ownerKept && viewer.words < nWords, `viewer transcript has only the words that play (${viewer.words} of ${nWords})`, `viewer words: ${JSON.stringify(viewer)}, owner's kept words ${ownerKept}`);
   const dl = await vpage.evaluate(({ id, cam }) => Promise.all([`/raw/${id}?download=1`, `/raw/${id}?DOWNLOAD`, cam ? `/raw/${id}/cam?Download=1` : null].filter(Boolean).map((u) => fetch(u).then((r) => r.status))), { id: meta.id, cam: meta.hasCam });
   check(dl.every((s) => s === 403), 'viewer download URLs refused (any spelling)', `viewer download statuses ${dl}`);
   if (meta.hasCam) {
@@ -654,7 +747,7 @@ try {
     await vpage.waitForSelector('.sp');
     const hidden = await vpage.evaluate((id) => Promise.all([fetch(`/raw/${id}/cam`, { headers: { Range: 'bytes=0-1' } }).then((r) => r.status), fetch(`/thumb/${id}/cam.jpg`).then((r) => r.status)])
       .then(([raw, thumb]) => ({ raw, thumb, el: !!document.querySelector('.sp-cam'), avatar: !!document.querySelector('img.avatar'), hasCam: JSON.parse(document.getElementById('shuttle-data').textContent).video.hasCam, og: document.querySelector('meta[property="og:image"]')?.content })), meta.id);
-    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s$/.test(hidden.og || ''),
+    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s(&v=\d+)?$/.test(hidden.og || ''),
       'Screen layout: viewers get no camera file, camera thumbnail, avatar or face in the preview', `Screen layout leaks the camera: ${JSON.stringify(hidden)}`);
     await vpage.screenshot({ path: path.join(out, '12b-viewer-screen-layout.png') });
     const ownerCam = await page.evaluate(() => ({ el: !!document.querySelector('.sp-cam'), hidden: document.querySelector('.sp-cam-wrap')?.hidden }));
@@ -664,6 +757,17 @@ try {
   }
   await vpage.screenshot({ path: path.join(out, '12-viewer.png') });
   await vctx.close();
+
+  // Reset takes the trim off again; the cuts stay.
+  {
+    const before = await videoNow();
+    await page.click('.trim-row button:has-text("Reset")');
+    await page.waitForTimeout(900);
+    const after = await videoNow();
+    const handles = await page.evaluate(() => ({ lo: Number(document.querySelector('.trim-lo').value), hi: Number(document.querySelector('.trim-hi').value), max: Number(document.querySelector('.trim-hi').max), resetHidden: document.querySelector('.trim-row button').hidden }));
+    check(before.trim && after.trim === null && after.cuts.length >= 1 && JSON.stringify(after.cuts) === JSON.stringify(before.cuts) && handles.lo === 0 && handles.hi >= handles.max - 0.06 && handles.resetHidden,
+      `Reset removes the trim and keeps the ${after.cuts.length} cut(s)`, `Reset: trim ${JSON.stringify(before.trim)} → ${JSON.stringify(after.trim)}, cuts ${JSON.stringify(before.cuts)} → ${JSON.stringify(after.cuts)}, handles ${JSON.stringify(handles)}`);
+  }
 
   // library
   await page.goto(BASE + '/');

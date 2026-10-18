@@ -1,6 +1,7 @@
 import { $, h, icon, toast, api, fmtDuration, fmtAgo, fmtSize, copyText } from './ui.js';
 import { Session, canRecordScreen, makeThumbs, pickMime } from './recorder.js';
 import { Bubble } from './bubble.js';
+import { editedDuration, withTrim } from './timeline.js';
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem('shuttle.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
@@ -64,6 +65,12 @@ async function renderLibrary() {
   $('#empty').hidden = videos.length > 0;
 }
 
+// The length as it plays: without the cuts and the trim (ms).
+function playLength(v) {
+  const d = v.durationMs / 1000;
+  return editedDuration(withTrim(v.cuts, v.trim, d), d) * 1000;
+}
+
 function card(v) {
   const interrupted = v.status === 'recording' && Date.now() - (v.updatedAt || v.createdAt) > 3 * 60000;
   const live = v.status === 'recording' && !interrupted;
@@ -75,7 +82,7 @@ function card(v) {
   const el = h('article', { class: 'card' },
     h('a', { class: 'thumb', href: link },
       h('img', { src: `/thumb/${v.id}/og.jpg?v=${v.updatedAt || ''}`, alt: '', loading: 'lazy' }),
-      v.status === 'ready' && v.durationMs ? h('span', { class: 'dur' }, fmtDuration(v.durationMs)) : null,
+      v.status === 'ready' && v.durationMs ? h('span', { class: 'dur' }, fmtDuration(playLength(v))) : null,
       interrupted ? h('span', { class: 'badge' }, 'Interrupted') : null,
       live ? h('span', { class: 'badge' }, 'Recording') : null,
     ),

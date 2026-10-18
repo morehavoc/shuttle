@@ -207,6 +207,15 @@ export class Player extends EventTarget {
 
   replay() { this.ended = true; this.play(); }
 
+  // The frame at source time t, paused, even inside a cut: what the trim handles show.
+  previewAt(t) {
+    if (!this.main.paused) this.main.pause();
+    if (!this.started) { this.started = true; this.bigPlay.hidden = true; this.el.classList.add('started'); }
+    if (this.ended) { this.ended = false; this.endBox.hidden = true; }
+    this.main.currentTime = Math.max(0, Math.min(t, this.duration || t));
+    this.ui();
+  }
+
   seekEdited(te) { this.seekSource(toSource(Math.max(0, te), this.cuts, this.duration)); }
 
   seekSource(t) {
