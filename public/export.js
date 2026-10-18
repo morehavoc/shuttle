@@ -2,7 +2,7 @@
 // canvas laid out exactly like the share page (same layout, edits skipped), and records that
 // with the screen's audio as one video file. Runs in the owner's browser; Workers can't encode.
 
-import { layoutBoxes } from './player.js';
+import { layoutBoxes, rawUrl } from './player.js';
 import { normalizeCuts, keepSegments } from './timeline.js';
 
 const MIMES = ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'];
@@ -45,8 +45,8 @@ function roundRect(g, x, y, w, h, r) {
 
 // → Blob. onProgress(0..1). Stops early (rejects with AbortError) when signal aborts.
 export async function exportComposite(v, { layout, ownerName = '', onProgress = () => {}, signal } = {}) {
-  const main = media(`/raw/${v.id}`, false);
-  const cam = v.hasCam ? media(`/raw/${v.id}/cam`, true) : null;
+  const main = media(rawUrl(v, 'main'), false);
+  const cam = v.hasCam ? media(rawUrl(v, 'cam'), true) : null;
   const abort = () => { if (signal && signal.aborted) throw new DOMException('Cancelled', 'AbortError'); };
   await Promise.all([ready(main), cam ? ready(cam) : null]);
   abort();

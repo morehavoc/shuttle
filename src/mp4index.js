@@ -20,6 +20,10 @@
 
 const MAX_MOOF = 1 << 20; // a recorder's moof is a few KB
 const MAX_FRAGMENTS = 50000; // ~1 s fragments for 14 hours
+// Each read covers several fragments (moof + mdat): a few dozen round trips to storage for a
+// long recording instead of one per second of video, so the index is there by the time the
+// share page opens. Bounded, whatever the file claims.
+export const READ_WINDOW = 4 * 1024 * 1024;
 
 const enc = (s) => [...s].map((c) => c.charCodeAt(0));
 const typeOf = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
@@ -195,9 +199,9 @@ export async function buildSidx(read, size) {
   let done = false;
   while (!done && pos + 8 <= size) {
     if (++guard > MAX_FRAGMENTS * 2) return null;
-    // One read per fragment: the moof is a few KB, so 64 KB covers it and the next box's header.
+    // A window of fragments per read; a moof that runs past it is read on its own.
     let base = pos;
-    let buf = await read(pos, Math.min(64 * 1024, size - pos));
+    let buf = await read(pos, Math.min(READ_WINDOW, size - pos));
     for (;;) {
       const rel = pos - base;
       if (rel + 16 > buf.length && pos + 16 <= size) break; // header not in this buffer: read again

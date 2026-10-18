@@ -8,6 +8,10 @@ unset CF_API_TOKEN CF_ACCOUNT_ID CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID
 rm -rf .wrangler/e2e-state
 FAKE_VAR="--var TRANSCRIBE_FAKE:1"
 [ "$TRANSCRIBE" = real ] && FAKE_VAR=""
+# INDEX_DELAY_MS=8000: the fast-start index lands that long after it was built (tests only).
+[ -n "$INDEX_DELAY_MS" ] && FAKE_VAR="$FAKE_VAR --var INDEX_DELAY_MS:$INDEX_DELAY_MS"
+# INDEX_WAIT_MS=2000: "complete" stops waiting for the index sooner than its 15 s.
+[ -n "$INDEX_WAIT_MS" ] && FAKE_VAR="$FAKE_VAR --var INDEX_WAIT_MS:$INDEX_WAIT_MS"
 mkdir -p test/out
 npx wrangler d1 migrations apply shuttle --local --env local --persist-to .wrangler/e2e-state >/dev/null 2>&1
 npx wrangler dev --env local --port "$PORT" --ip 100.102.103.67 --local-protocol https \

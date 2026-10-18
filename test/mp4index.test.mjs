@@ -1,7 +1,7 @@
 // The fragment index builder on hostile input: every call returns quickly, never throws, and
 // never asks for more than it needs. node test/mp4index.test.mjs
 import assert from 'node:assert/strict';
-import { buildSidx } from '../src/mp4index.js';
+import { buildSidx, READ_WINDOW } from '../src/mp4index.js';
 
 let n = 0, failed = 0;
 const t = async (name, fn) => { n++; try { await fn(); console.log('  ok  ', name); } catch (e) { failed++; console.log('  FAIL', name, '\n       ', e.message); } };
@@ -73,11 +73,23 @@ await t('100,000 tiny boxes take linear time', async () => {
   assert.ok(ms < 1000, `${ms.toFixed(0)} ms`);
 });
 
-await t('a moof claiming 2 MB is refused without reading it', async () => {
+await t('a moof claiming 2 MB is refused without reading it on its own', async () => {
   const big = Buffer.concat([u32(2 * 1024 * 1024), Buffer.from('moof'), Buffer.alloc(2 * 1024 * 1024 - 8)]);
-  const { r, biggest } = await timed(file(ftyp, moov, frag(0, 30), big, frag(30 * DUR, 30)));
-  assert.equal(r, null);
-  assert.ok(biggest <= 256 * 1024, `largest read ${biggest} bytes`);
+  const buf = file(ftyp, moov, frag(0, 30), big, frag(30 * DUR, 30));
+  const { read, log } = reader(buf);
+  assert.equal(await buildSidx(read, buf.length), null);
+  // Reads are the head, then windows of the file: never one sized by what a box claims.
+  assert.ok(log.biggest <= READ_WINDOW, `largest read ${log.biggest} bytes`);
+  assert.ok(log.reads <= 2, `${log.reads} reads`);
+});
+
+await t('a long recording takes a few reads, not one per fragment', async () => {
+  const mdat = Buffer.concat([u32(8 + 400000), Buffer.from('mdat'), Buffer.alloc(400000)]); // ~3 Mbps, 1 s
+  const frags = Array.from({ length: 180 }, (_, i) => Buffer.concat([frag(i * 30 * DUR, 30), mdat]));
+  const buf = file(ftyp, moov, ...frags);
+  const { read, log } = reader(buf);
+  assert.ok(await buildSidx(read, buf.length), 'indexed');
+  assert.ok(log.reads <= Math.ceil(buf.length / READ_WINDOW) + 2, `${log.reads} reads for ${(buf.length / 1e6).toFixed(0)} MB`);
 });
 
 await t('a 64-bit size past 2^53 is not a box', async () => {
