@@ -166,7 +166,7 @@ function openSetup() {
     if (setup.micOn) acquireMic(); else stopStream('micStream');
   } });
   micSel.disabled = !setup.micOn;
-  const startBtn = h('button', { class: 'btn btn-rec btn-lg', id: 'start', type: 'button', onclick: onStart, html: `<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>Start recording` });
+  const startBtn = h('button', { class: 'btn btn-rec btn-lg', id: 'start', type: 'button', onclick: onStart, html: `${REC_DOT}Start recording` });
 
   const el = h('div', { class: 'sheet-backdrop', onclick: (e) => { if (e.target === el) closeSetup(); } },
     h('div', { class: 'sheet', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'New recording' },
@@ -207,7 +207,20 @@ function setMode(id) {
 
 function needsCamera() { return setup.mode !== 'screen'; }
 
+// Start waits for the camera: disabled while it starts (says so, with a spinner), and while
+// it's unavailable (the preview says why). Screen-only needs no camera.
+const REC_DOT = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>';
+function syncStart() {
+  const b = setup.el && $('#start', setup.el);
+  if (!b) return;
+  const waiting = needsCamera() && !setup.cameraStream;
+  const loading = waiting && !setup.camMsg;
+  b.disabled = waiting;
+  b.innerHTML = loading ? '<span class="spin-sm" aria-hidden="true"></span>Starting camera…' : `${REC_DOT}Start recording`;
+}
+
 function renderPreview() {
+  syncStart();
   const p = $('#preview', setup.el);
   const camRow = $('#cam-row', setup.el);
   camRow.style.display = needsCamera() ? '' : 'none';

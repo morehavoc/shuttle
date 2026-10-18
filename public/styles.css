@@ -66,6 +66,7 @@ a { color: inherit; }
   outline: 3px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 2px;
 }
 .btn[disabled] { opacity: .5; cursor: default; }
+.spin-sm { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255, 255, 255, .35); border-top-color: #fff; animation: spin .8s linear infinite; }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 30%, transparent); }
 .btn-primary:hover { background: var(--accent-2); border-color: var(--accent-2); }
 .btn-ghost { background: transparent; border-color: transparent; }
