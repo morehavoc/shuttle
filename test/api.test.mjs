@@ -409,6 +409,52 @@ try {
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
+  await test('fragment index: built after complete, spliced into the served file, byte-exact', async () => {
+    // A Chrome-style recording: fragments that locate their data relative to themselves.
+    const frag = path.join(root, 'test/out/sample-moof.mp4');
+    // No B-frames, like MediaRecorder's output.
+    execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-i', path.join(root, 'test/out/sample.mp4'), '-c:v', 'libx264', '-bf', '0', '-g', '60', '-preset', 'ultrafast', '-c:a', 'copy', '-movflags', 'frag_keyframe+empty_moov+default_base_moof', frag]);
+    const file = readFileSync(frag);
+    const { buildSidx } = await import('../src/mp4index.js');
+    const idx = await buildSidx(async (o, l) => new Uint8Array(file.buffer, file.byteOffset + o, Math.min(l, file.length - o)), file.length);
+    assert.ok(idx, 'the fixture is indexable');
+    const expected = Buffer.concat([file.subarray(0, idx.at), Buffer.from(idx.sidx), file.subarray(idx.at)]);
+    const c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4' } }));
+    let n = 0;
+    for (let off = 0; off < file.length; off += PART) await call(`/api/videos/${c.id}/parts/${++n}`, { method: 'PUT', body: new Uint8Array(file.subarray(off, off + PART)) });
+    assert.equal((await call(`/api/videos/${c.id}/complete`, { method: 'POST', body: { durationMs: 20000, width: 1280, height: 720, mime: 'video/mp4' } })).status, 200);
+    let len = 0;
+    for (let i = 0; i < 60 && len !== expected.length; i++) {
+      len = Number((await call(`/raw/${c.id}`, { method: 'HEAD', anon: true })).headers.get('content-length'));
+      if (len !== expected.length) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.equal(len, expected.length, `served size includes the ${idx.sidx.length}-byte index`);
+    let r = await call(`/raw/${c.id}`, { anon: true });
+    assert.equal(r.status, 200);
+    assert.match(r.headers.get('etag'), /-x"$/, 'a different ETag than the stored file');
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(expected), 'whole file');
+    const L = expected.length, at = idx.at, end = idx.at + idx.sidx.length;
+    for (const [lo, hi] of [[0, 99], [at - 10, at + 10], [at + 5, end + 5], [end - 3, end + 3], [at, L - 1], [L - 200, L - 1], [0, L - 1]]) {
+      r = await call(`/raw/${c.id}`, { anon: true, headers: { Range: `bytes=${lo}-${hi}` } });
+      assert.equal(r.status, 206);
+      assert.equal(r.headers.get('content-range'), `bytes ${lo}-${hi}/${L}`);
+      assert.ok(Buffer.from(await r.arrayBuffer()).equals(expected.subarray(lo, hi + 1)), `range ${lo}-${hi}`);
+    }
+    r = await call(`/raw/${c.id}`, { anon: true, headers: { Range: 'bytes=-700' } });
+    assert.ok(Buffer.from(await r.arrayBuffer()).equals(expected.subarray(L - 700)), 'suffix range');
+    // The served file decodes cleanly and reports the same length.
+    const out = path.join(root, 'test/out/served-indexed.mp4');
+    (await import('node:fs')).writeFileSync(out, expected);
+    let errs = '';
+    try { execFileSync('ffmpeg', ['-v', 'error', '-i', out, '-f', 'null', '-'], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch (e) { errs = String(e.stderr || e.message); }
+    assert.equal(errs, '', 'decodes with no errors');
+    const dur = (f) => Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', f]).toString());
+    assert.ok(Math.abs(dur(out) - dur(frag)) < 0.05, `duration ${dur(out)} vs ${dur(frag)}`);
+    // A stored file that can't be indexed (absolute offsets) is served exactly as stored.
+    assert.equal(Number((await call(`/raw/${id}`, { method: 'HEAD', anon: true })).headers.get('content-length')), sample.length);
+    await call(`/api/videos/${c.id}`, { method: 'DELETE' });
+  });
+
   await test('starting speed: owner picks it, viewers see it, bad values refused', async () => {
     let c = await j(await call('/api/videos', { method: 'POST', body: { mime: 'video/mp4', speed: 1.2 } }));
     assert.equal((await j(await call(`/api/videos/${c.id}`))).speed, 1.2, 'set at creation');
