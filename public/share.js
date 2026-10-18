@@ -205,9 +205,76 @@ function ownerPanel() {
     sync();
     parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
   }
+  parts.push(trimRow());
   parts.push(speedRow());
   parts.push(keepRow());
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
+}
+
+// Trim: two handles that cut the start and the end. They are ordinary cuts (from 0, and to
+// the end), so Undo, the transcript, viewers and the "with your edits" download follow them.
+let onCutsChanged = null;
+function trimRow() {
+  const MIN = 1; // seconds that must stay between the handles
+  const EDGE = 0.1; // a handle this close to its end is no trim (the slider rounds to its step)
+  const lo = h('input', { type: 'range', class: 'trim-lo', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim start' });
+  const hi = h('input', { type: 'range', class: 'trim-hi', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim end' });
+  const fill = h('div', { class: 'trim-fill' });
+  const label = h('span', { class: 'row-note trim-label' });
+  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => commit(0, duration()) }, 'Reset');
+  const current = () => {
+    const d = duration();
+    let s = 0, e = d;
+    for (const c of cuts) { if (c[0] <= 0.01) s = Math.max(s, c[1]); if (c[1] >= d - 0.01) e = Math.min(e, c[0]); }
+    return [s, e];
+  };
+  const paint = (s, e) => {
+    const d = duration() || 1;
+    fill.style.left = `${(s / d) * 100}%`;
+    fill.style.width = `${Math.max(0, ((e - s) / d) * 100)}%`;
+    label.textContent = `${fmtDuration(s * 1000)} – ${fmtDuration(e * 1000)}`;
+    reset.hidden = s <= EDGE && e >= d - EDGE;
+    // The handles overlap when they are close; the one on top is the one that can still move.
+    lo.classList.toggle('on-top', s + e > d);
+  };
+  const sync = () => {
+    const d = duration();
+    lo.max = hi.max = String(d);
+    const [s, e] = current();
+    lo.value = String(s);
+    hi.value = String(e);
+    paint(s, e);
+  };
+  lo.addEventListener('input', () => {
+    const e = Number(hi.value), s = Math.max(0, Math.min(Number(lo.value), e - MIN));
+    lo.value = String(s);
+    paint(s, e);
+    player.previewAt(s);
+  });
+  hi.addEventListener('input', () => {
+    const s = Number(lo.value), e = Math.min(duration(), Math.max(Number(hi.value), s + MIN));
+    hi.value = String(e);
+    paint(s, e);
+    player.previewAt(e);
+  });
+  lo.addEventListener('change', () => commit(Number(lo.value), Number(hi.value)));
+  hi.addEventListener('change', () => commit(Number(lo.value), Number(hi.value)));
+  function commit(s, e) {
+    const d = duration();
+    let next = cuts.filter((c) => c[0] > 0.01 && c[1] < d - 0.01);
+    if (s > EDGE) next = addCut(next, [0, s], d);
+    if (e < d - EDGE) next = addCut(next, [e, d], d);
+    next = normalizeCuts(next, d);
+    // A handle let go inside the edge cuts nothing yet; leave it where it is (re-reading the
+    // cuts would put it back at the end, so arrow keys could never step out of the edge).
+    if (JSON.stringify(next) === JSON.stringify(normalizeCuts(cuts, d))) return;
+    apply(next, s <= EDGE && e >= d - EDGE ? 'Trim removed' : 'Trimmed');
+  }
+  onCutsChanged = sync;
+  for (const ev of ['loadedmetadata', 'durationchange']) player.main.addEventListener(ev, sync); // the real length may arrive later
+  sync();
+  return h('div', { class: 'layout-row trim-row' }, h('span', { class: 'row-label' }, 'Trim'),
+    h('div', { class: 'trim' }, h('div', { class: 'trim-rail' }), fill, lo, hi), label, reset);
 }
 
 const SPEED_CHOICES = [1, 1.2, 1.5, 2];
@@ -399,6 +466,7 @@ function apply(next, message, { record = true } = {}) {
   const undoBtn = $('#undo');
   if (undoBtn) undoBtn.disabled = !undoStack.length;
   renderWhen();
+  if (onCutsChanged) onCutsChanged();
   if (message) toast(message);
   clearTimeout(saveTimer);
   saveTimer = setTimeout(save, 400);

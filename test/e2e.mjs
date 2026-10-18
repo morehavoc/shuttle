@@ -590,21 +590,78 @@ try {
   const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
   check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
 
-  // The served files carry a fragment index (sidx) so Chrome starts them in one or two
-  // requests instead of reading every fragment first (built in the background after complete).
+  // ---------- trim the start and the end ----------
+  const savedCuts = async () => (await (await page.request.get(`${BASE}/api/videos/${meta.id}`)).json()).cuts || [];
+  const total = () => page.evaluate(() => { const [m, s] = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number); return m * 60 + s; });
+  let trimStart = 0;
   {
-    const hasIndex = async (track) => {
+    await page.locator('.trim-row').scrollIntoViewIfNeeded();
+    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
+    const box = await page.locator('.trim').boundingBox();
+    // Drag the start handle a quarter of the way in with the mouse; the player shows that frame.
+    const y = box.y + box.height / 2, x0 = box.x + 7; // centre of the 14 px thumb at 0
+    await page.mouse.move(x0, y);
+    await page.mouse.down();
+    for (let i = 1; i <= 10; i++) await page.mouse.move(x0 + box.width * 0.25 * (i / 10), y);
+    await page.waitForTimeout(300);
+    const during = await page.evaluate(() => ({ t: document.querySelector('.sp-main').currentTime, paused: document.querySelector('.sp-main').paused, lo: Number(document.querySelector('.trim-lo').value), label: document.querySelector('.trim-label').textContent }));
+    await page.mouse.up();
+    await page.waitForTimeout(900); // debounced save
+    trimStart = during.lo;
+    check(during.paused && Math.abs(during.t - during.lo) < 0.15 && during.lo > d * 0.15,
+      `dragging the start handle previews that frame (${during.lo.toFixed(2)} s, "${during.label}")`, `start handle drag: ${JSON.stringify(during)} of ${d}`);
+    let cuts = await savedCuts();
+    check(cuts.length && cuts[0][0] === 0 && Math.abs(cuts[0][1] - trimStart) < 0.06, `start trim saved as a cut [0, ${cuts[0] && cuts[0][1]}]`, `start trim cuts: ${JSON.stringify(cuts)}`);
+    // The end handle from the keyboard: 20 steps of 0.05 s.
+    await page.focus('.trim-hi');
+    for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(900);
+    cuts = await savedCuts();
+    const last = cuts[cuts.length - 1] || [];
+    const hiVal = await page.evaluate(() => Number(document.querySelector('.trim-hi').value));
+    check(Math.abs(last[0] - hiVal) < 0.06 && last[1] >= d - 0.06 && Math.abs(d - hiVal - 1) < 0.15, `end trim saved as a cut [${last[0]}, ${last[1]}] (1 s off the end)`, `end trim: handle ${hiVal}, cuts ${JSON.stringify(cuts)} of ${d}`);
+    const { editedDuration } = await import('../public/timeline.js');
+    const want = editedDuration(cuts, d), shown = await total();
+    check(Math.abs(shown - want) <= 1, `player length follows the trim (${shown} s)`, `player shows ${shown} s, cuts give ${want.toFixed(2)} s`);
+    // Play starts at the trimmed start.
+    await page.click('.sp-controls .sp-btn >> nth=0');
+    await page.waitForTimeout(200);
+    const t0 = await page.evaluate(() => { const m = document.querySelector('.sp-main'); m.pause(); return m.currentTime; });
+    check(t0 >= trimStart - 0.05 && t0 < trimStart + 1.5, `owner's Play starts at the trimmed start (${t0.toFixed(2)} s)`, `owner played from ${t0}, trim ${trimStart}`);
+    await shot('11b-trim.png');
+  }
+
+  // A served file with more than one fragment carries a fragment index (sidx) in front of the
+  // first, so Chrome starts it in one or two requests instead of reading every fragment first
+  // (built in the background after complete). A short recording can be a single fragment, with
+  // nothing to index; the API test covers the index itself byte for byte.
+  {
+    const topBoxes = (buf) => {
+      const boxes = [];
+      for (let o = 0; o + 8 <= buf.length;) {
+        let size = buf.readUInt32BE(o);
+        if (size === 1) size = Number(buf.readBigUInt64BE(o + 8));
+        else if (size === 0) size = buf.length - o;
+        if (size < 8) break;
+        boxes.push(buf.toString('latin1', o + 4, o + 8));
+        o += size;
+      }
+      return boxes;
+    };
+    const indexState = async (track) => {
+      let boxes = [];
       for (let i = 0; i < 50; i++) {
-        const buf = Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`, { headers: { Range: 'bytes=0-8191' } })).body());
-        if (buf.includes(Buffer.from('sidx'))) return true;
+        boxes = topBoxes(Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`)).body()));
+        const moofs = boxes.filter((b) => b === 'moof').length, at = boxes.indexOf('sidx');
+        if (moofs < 2) return { track: track || 'main', moofs, ok: at < 0 };
+        if (at >= 0) return { track: track || 'main', moofs, ok: boxes[at + 1] === 'moof' };
         await page.waitForTimeout(100);
       }
-      return false;
+      return { track: track || 'main', ok: false, boxes: boxes.slice(0, 6) };
     };
-    const tracks = meta.hasCam ? ['', '/cam'] : [''];
-    const found = [];
-    for (const t of tracks) found.push(await hasIndex(t));
-    check(found.every(Boolean), `served file${tracks.length > 1 ? 's carry' : ' carries'} a fragment index`, `no fragment index: ${JSON.stringify(found)}`);
+    const states = [];
+    for (const t of meta.hasCam ? ['', '/cam'] : ['']) states.push(await indexState(t));
+    check(states.every((x) => x.ok), `served files: fragment index wherever there is more than one fragment (${states.map((x) => `${x.track} ${x.moofs} fragment${x.moofs === 1 ? '' : 's'}`).join(', ')})`, `fragment index: ${JSON.stringify(states)}`);
   }
 
   // ---------- what a viewer sees ----------
@@ -615,6 +672,8 @@ try {
   const vSpeed = await vpage.evaluate(() => document.querySelector('.sp-main, .sp video').playbackRate);
   check(vSpeed === 1.2, 'viewer\'s player starts at the owner\'s speed', `viewer starts at ${vSpeed}`);
   await vpage.click('.sp-big'); // the controls appear once it's playing
+  const vStart = await vpage.evaluate(() => document.querySelector('.sp-main').currentTime);
+  check(vStart >= trimStart - 0.05, `viewer's video starts after the trimmed start (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}, trim ${trimStart}`);
   await vpage.waitForTimeout(600);
   await vpage.hover('.sp');
   await vpage.click('.sp-speed');
@@ -664,6 +723,17 @@ try {
   }
   await vpage.screenshot({ path: path.join(out, '12-viewer.png') });
   await vctx.close();
+
+  // Reset takes the trim off again (other cuts stay).
+  {
+    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
+    await page.click('.trim-row button:has-text("Reset")');
+    await page.waitForTimeout(900);
+    const cuts = await savedCuts();
+    const reset = await page.evaluate(() => ({ lo: Number(document.querySelector('.trim-lo').value), hi: Number(document.querySelector('.trim-hi').value), max: Number(document.querySelector('.trim-hi').max), btn: document.querySelector('.trim-row button').hidden }));
+    check(!cuts.some((c) => c[0] <= 0.01 || c[1] >= d - 0.01) && reset.lo === 0 && reset.hi >= reset.max - 0.06 && reset.btn,
+      'Reset removes the trim', `after Reset: cuts ${JSON.stringify(cuts)}, handles ${JSON.stringify(reset)}`);
+  }
 
   // library
   await page.goto(BASE + '/');

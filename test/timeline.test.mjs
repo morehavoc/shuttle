@@ -24,6 +24,12 @@ t('keep segments are the complement', () => {
   assert.deepEqual(keepSegments([[0, 2], [8, 10]], 10), [[2, 8]]);
   assert.deepEqual(keepSegments([], 10), [[0, 10]]);
 });
+t('keep segments drop rounding slivers at the start and end', () => {
+  assert.deepEqual(keepSegments([[0, 2], [8, 9.315]], 9.31533), [[2, 8]]); // trim to the end, stored to the ms
+  assert.deepEqual(keepSegments([[0.02, 3]], 10), [[3, 10]]);
+  assert.deepEqual(keepSegments([], 0.02), [[0, 0.02]]); // a whole (tiny) video still plays
+  near(toSource(6, [[0, 2], [8, 9.315]], 9.31533), 8);
+});
 t('edited duration', () => {
   near(editedDuration([[1, 2], [5, 6]], 10), 8);
   near(editedDuration([[0, 10]], 10), 0);

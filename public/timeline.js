@@ -37,7 +37,10 @@ export function removeCut(cuts, [s, e], duration) {
   return normalizeCuts(out, duration);
 }
 
-// The parts that play: complement of the cuts inside [0, duration].
+// The parts that play: complement of the cuts inside [0, duration]. Slivers left between a cut
+// and the start or end are dropped: cuts are stored to the millisecond, so a trim to the end
+// of a 9.31533 s file stops at 9.315 and would otherwise leave a third of a millisecond
+// "playing" after it (and Play, finding it, would not start over from the beginning).
 export function keepSegments(cuts, duration) {
   const segs = [];
   let t = 0;
@@ -46,7 +49,8 @@ export function keepSegments(cuts, duration) {
     t = Math.max(t, e);
   }
   if (duration > t) segs.push([t, duration]);
-  return segs;
+  const real = segs.filter(([s, e]) => e - s >= MIN_CUT);
+  return real.length ? real : segs;
 }
 
 export function editedDuration(cuts, duration) {

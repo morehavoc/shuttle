@@ -13,6 +13,7 @@ Record your screen and camera, get a link. Styled after christophermoravec.com (
 - **Description:** once the transcript is done, a title (only if you haven't renamed it) and a one- or two-sentence description are drafted for you; edit either in place, or **Write one for me** again. Your own text is never overwritten.
 - **Expiry:** each video keeps 7, 30 or 90 days, or forever (new recordings use your last choice; 30 days to start). Expired videos disappear at once and are deleted by an hourly cron (`[triggers]` in `wrangler.toml`).
 - **Editing from the transcript** (owner): select words and cut them, **Remove ums**, **Shorten pauses** (pauses of 1–8 s; a longer silence is usually you showing something), undo, restore all. Captions come from the same words.
+- **Trim** (owner): two handles cut the start and the end; the player shows the frame under the handle while you drag. A trim is an ordinary cut, so Undo, the transcript, viewers and the edited download follow it.
 - **Share page** at `/v/<id>`. It has:
   - link-preview tags;
   - speed (1×–2×), captions, keyboard shortcuts;
@@ -62,10 +63,10 @@ npm run dev                                       # migrations + wrangler dev --
 ## Tests
 
 - `npm test` runs:
-  - the timeline maths (17 checks);
+  - the timeline maths (18 checks);
   - the transcript post-processing (17);
-  - the API contract (41), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
-- `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
+  - the API contract (43), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+- `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, trimming, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
   - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
   - `SURFACE=window` (a window share keeps the bubble)
   - `FAULT=flaky|fatal` (dropped network, refused upload; `NOISE=1` for a high bitrate)
