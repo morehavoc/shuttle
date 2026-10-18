@@ -84,9 +84,11 @@ function readMoov(b, moov) {
   }
   let video = null;
   const scales = {};
+  // Field offsets depend on the version byte; a box too short for its fields is skipped.
+  const fits = (box, v1, v0) => box.size >= box.hdr + (b[box.start + box.hdr] === 1 ? v1 : v0);
   for (const trak of children(b, moov, 'trak')) {
     const tk = child(b, trak, 'tkhd'), md = child(b, trak, 'mdia'), mh = md && child(b, md, 'mdhd');
-    if (tk && mh) {
+    if (tk && mh && fits(tk, 24, 16) && fits(mh, 24, 16)) {
       const tid = dv.getUint32(tk.start + tk.hdr + (b[tk.start + tk.hdr] === 1 ? 20 : 12));
       scales[tid] = dv.getUint32(mh.start + mh.hdr + (b[mh.start + mh.hdr] === 1 ? 20 : 12));
     }
@@ -97,7 +99,8 @@ function readMoov(b, moov) {
     if (!tkhd || !mdia) continue;
     const hdlr = child(b, mdia, 'hdlr');
     const mdhd = child(b, mdia, 'mdhd');
-    if (!hdlr || !mdhd || typeOf(b, hdlr.start + hdlr.hdr + 8) !== 'vide') continue;
+    if (!hdlr || !mdhd || hdlr.size < hdlr.hdr + 12 || !fits(tkhd, 24, 16) || !fits(mdhd, 24, 16)) continue;
+    if (typeOf(b, hdlr.start + hdlr.hdr + 8) !== 'vide') continue;
     const tv = b[tkhd.start + tkhd.hdr];
     const id = dv.getUint32(tkhd.start + tkhd.hdr + (tv === 1 ? 20 : 12));
     const mv = b[mdhd.start + mdhd.hdr];
@@ -118,9 +121,11 @@ function readMoof(b, moof, video, trex, scales) {
     const tfhd = child(b, traf, 'tfhd');
     if (!tfhd) continue;
     let o = tfhd.start + tfhd.hdr;
+    if (tfhd.size < tfhd.hdr + 8) return 'bad';
     const tf = dv.getUint32(o) & 0xffffff;
     const id = dv.getUint32(o + 4);
     if (tf & 0x1) return 'absolute';
+    if (tfhd.size < tfhd.hdr + 8 + 4 * ((tf & 0x2 ? 1 : 0) + (tf & 0x8 ? 1 : 0) + (tf & 0x10 ? 1 : 0) + (tf & 0x20 ? 1 : 0))) return 'bad';
     o += 8;
     if (tf & 0x2) o += 4; // sample description index
     const defDur = tf & 0x8 ? dv.getUint32(o) : (trex[id] ? trex[id].duration : 0);
@@ -130,6 +135,7 @@ function readMoof(b, moof, video, trex, scales) {
     const tfdt = child(b, traf, 'tfdt');
     if (!tfdt) continue;
     const vv = b[tfdt.start + tfdt.hdr];
+    if (tfdt.size < tfdt.hdr + (vv === 1 ? 12 : 8)) return 'bad';
     const time = vv === 1 ? Number(dv.getBigUint64(tfdt.start + tfdt.hdr + 4)) : dv.getUint32(tfdt.start + tfdt.hdr + 4);
     let duration = 0;
     let firstFlags = null;

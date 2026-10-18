@@ -77,7 +77,10 @@ async function route(request, env, ctx) {
   if (path === '/api/login' && method === 'POST') return login(request, env, url);
   if (path === '/api/logout' && method === 'POST') {
     checkSameOrigin(request, url);
-    return json({ ok: true }, 200, { 'Set-Cookie': `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax` });
+    const res = json({ ok: true });
+    // Signing out forgets this browser too (it no longer counts as one he signs in from).
+    for (const name of [COOKIE, DEVICE_COOKIE]) res.headers.append('Set-Cookie', `${name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`);
+    return res;
   }
 
   // Public reads (the id is the capability).
@@ -142,7 +145,7 @@ async function login(request, env, url) {
   const allowed = recent.everyone > LOGIN_GLOBAL ? LOGIN_PER_IP_FLOOD : LOGIN_PER_IP;
   // A flood big enough to be guessing from many addresses at once: only a browser that has
   // signed in before gets its password checked (so the owner still gets in from his own).
-  const shut = recent.everyone > LOGIN_GLOBAL_HARD && !(await signedCookie(request, env, DEVICE_COOKIE, 'device'));
+  const shut = recent.everyone > LOGIN_GLOBAL_HARD && !(await signedCookie(request, env, DEVICE_COOKIE, 'device', deviceMac));
   if (recent.mine > allowed || shut) {
     // Refused attempts don't count (only checked ones do), so hammering doesn't extend the wait.
     await env.DB.prepare('DELETE FROM login_failures WHERE rowid = ?').bind(rid).run();
@@ -160,39 +163,53 @@ async function login(request, env, url) {
   const dexp = Date.now() + DEVICE_DAYS * 864e5;
   const res = json({ ok: true });
   res.headers.append('Set-Cookie', `${COOKIE}=${exp}.${await hmac(env, `owner.${exp}`)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`);
-  res.headers.append('Set-Cookie', `${DEVICE_COOKIE}=${dexp}.${await hmac(env, `device.${dexp}`)}; Path=/; Max-Age=${DEVICE_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`);
+  res.headers.append('Set-Cookie', `${DEVICE_COOKIE}=${dexp}.${await deviceMac(env, `device.${dexp}`)}; Path=/; Max-Age=${DEVICE_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`);
   return res;
 }
 
 // What a login attempt is counted against: an IPv4 address, or an IPv6 /64 (one machine can
-// hold a whole /64, so counting single IPv6 addresses would allow unlimited tries).
+// hold a whole /64, so counting single IPv6 addresses would allow unlimited tries). An
+// IPv4-mapped IPv6 address counts as its IPv4 address.
 export function loginNet(ip) {
   if (!ip) return 'local';
-  if (!ip.includes(':') || ip.includes('.')) return ip; // IPv4 (or IPv4-mapped)
-  const [head, tail] = ip.toLowerCase().split('::');
+  let a = String(ip).trim().toLowerCase().replace(/%.*$/, ''); // no zone id
+  if (!a.includes(':')) return a;
+  a = a.replace(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/, (_, p, q, r, t) => `${((p << 8) | q).toString(16)}:${((r << 8) | t).toString(16)}`);
+  const [head, tail] = a.split('::');
   const h = head ? head.split(':') : [];
   const t = tail ? tail.split(':') : [];
-  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
-  return `${groups.slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':')}::/64`;
+  const g = (tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t]).map((x) => parseInt(x, 16) || 0);
+  if (g.length === 8 && g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) return `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+  return `${g.slice(0, 4).map((x) => x.toString(16)).join(':')}::/64`;
 }
 
 async function isOwner(request, env) {
-  return signedCookie(request, env, COOKIE, 'owner');
+  return signedCookie(request, env, COOKIE, 'owner', hmac);
 }
 
-// A cookie of ours holding `${exp}.${hmac(kind + '.' + exp)}`, still in date.
-async function signedCookie(request, env, name, kind) {
+// A cookie of ours holding `${exp}.${mac(kind + '.' + exp)}`, still in date.
+async function signedCookie(request, env, name, kind, mac) {
   if (!env.OWNER_PASSWORD) return false;
   const raw = (request.headers.get('Cookie') || '').split(/;\s*/).find((c) => c.startsWith(name + '='));
   if (!raw) return false;
   const [exp, sig] = raw.slice(name.length + 1).split('.');
   if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return safeEqual(sig, await hmac(env, `${kind}.${exp}`));
+  return safeEqual(sig, await mac(env, `${kind}.${exp}`));
+}
+
+// The device mark is signed without the password: changing it (during an attack, say) mustn't
+// shut his own browsers out with everyone else. Without a SESSION_SECRET (local runs) it uses
+// the session key.
+async function deviceMac(env, msg) {
+  return env.SESSION_SECRET ? macWith(`${env.SESSION_SECRET}|device`, msg) : hmac(env, msg);
 }
 
 async function hmac(env, msg) {
   // Keyed by the password, so changing the password signs everyone out.
-  const secret = (env.SESSION_SECRET || '') + '|' + env.OWNER_PASSWORD;
+  return macWith((env.SESSION_SECRET || '') + '|' + env.OWNER_PASSWORD, msg);
+}
+
+async function macWith(secret, msg) {
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const mac = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
   return b64url(new Uint8Array(mac));
@@ -655,23 +672,30 @@ function splicedBody(env, ctx, key, pieces, sidx, len) {
 }
 
 const indexing = new Set();
+// Builds one track's index; true if it started a build. The attempt is claimed in D1 first,
+// atomically (compare-and-set on a claim token), so two isolates can't build the same file at
+// once, and a build the runtime kills (CPU, memory) leaves its claim behind: after INDEX_TRIES
+// of those the file is left as it is. A read that fails is retried later, within those tries.
 async function indexTrack(env, id, track) {
   const k = `${id}:${track}`;
-  if (indexing.has(k)) return;
+  if (indexing.has(k)) return false;
   indexing.add(k);
   try {
     const key = videoKey(id, track);
+    const row = await env.DB.prepare(`SELECT json_extract(mp4_index, '$.' || ?) AS e FROM videos WHERE id = ?`).bind(track, id).first();
+    if (!row) return false;
+    const prev = parseJson(row.e, null);
     const head = await env.VIDEOS.head(key);
-    if (!head) return;
-    // Recorded before the build starts: a build the runtime kills (CPU, memory) leaves this
-    // behind, and after INDEX_TRIES of them the file is left as it is.
-    const row = await env.DB.prepare('SELECT mp4_index FROM videos WHERE id = ?').bind(id).first();
-    const prev = row && (parseJson(row.mp4_index, {}) || {})[track];
+    if (!head) { // no file (a camera that recorded nothing, a half-finished delete): not again
+      if (!(prev && prev.missing)) await storeIndex(env, id, track, { none: true, missing: true });
+      return false;
+    }
     const same = prev && prev.etag === head.etag;
-    if (same && (prev.sidx || prev.none)) return;
-    if (same && prev.pending && (prev.tries >= INDEX_TRIES || Date.now() - prev.at < 10 * 60e3)) return;
+    if (same && (prev.sidx || prev.none)) return false;
+    if (same && prev.pending && (prev.tries >= INDEX_TRIES || Date.now() - prev.since < 10 * 60e3)) return false;
     const tries = same && prev.pending ? prev.tries + 1 : 1;
-    await storeIndex(env, id, track, { pending: true, etag: head.etag, tries, at: Date.now() });
+    const claim = crypto.randomUUID();
+    if (!(await storeIndex(env, id, track, { pending: true, etag: head.etag, tries, since: Date.now(), claim }, (prev && prev.claim) || ''))) return false;
     const read = async (offset, length) => {
       const obj = await env.VIDEOS.get(key, { range: { offset, length } });
       if (!obj) throw new Error('range read failed');
@@ -681,38 +705,49 @@ async function indexTrack(env, id, track) {
     try {
       const r = await buildSidx(read, head.size);
       entry = r ? { at: r.at, etag: head.etag, sidx: b64encode(r.sidx) } : { none: true, etag: head.etag };
-    } catch (e) {
+    } catch (e) { // the parser doesn't throw; this is a failed read, worth another try later
       console.error(`index ${k}:`, e && e.message);
-      entry = { none: true, etag: head.etag, error: String(e && e.message || e).slice(0, 200) };
+      entry = { pending: true, etag: head.etag, tries, since: Date.now(), error: String(e && e.message || e).slice(0, 200) };
     }
-    await storeIndex(env, id, track, entry);
+    await storeIndex(env, id, track, entry, claim);
+    return true;
   } catch (e) {
     console.error(`index ${k}:`, e && e.message);
+    return false;
   } finally {
     indexing.delete(k);
   }
 }
 
-function storeIndex(env, id, track, entry) {
-  return env.DB.prepare(`UPDATE videos SET mp4_index = json_set(COALESCE(mp4_index, '{}'), '$.' || ?, json(?)) WHERE id = ?`)
-    .bind(track, JSON.stringify(entry), id).run();
+// Writes one track's index entry. With `expect`, only if the stored entry's claim is still that
+// ('' for none); returns whether it wrote.
+async function storeIndex(env, id, track, entry, expect = null) {
+  const set = `UPDATE videos SET mp4_index = json_set(COALESCE(mp4_index, '{}'), '$.' || ?, json(?)) WHERE id = ?`;
+  const r = expect === null
+    ? await env.DB.prepare(set).bind(track, JSON.stringify(entry), id).run()
+    : await env.DB.prepare(`${set} AND COALESCE(json_extract(mp4_index, '$.' || ? || '.claim'), '') = ?`).bind(track, JSON.stringify(entry), id, track, expect).run();
+  return !!(r.meta && r.meta.changes);
 }
 
-// A few MP4 tracks a run that have no index yet (recorded before indexing existed, or a build
-// that didn't finish), newest first.
+// Up to `max` index builds a run for MP4 tracks that have none yet (recorded before indexing
+// existed, or a build that didn't finish), newest first. Only builds that start count, so files
+// that can't be indexed never use up the run.
 async function indexBacklog(env, max = 3) {
   try {
+    // Without the sidx bytes (kilobytes of base64 each): only what's needed to choose.
     const { results } = await env.DB.prepare(
-      "SELECT id, mime, cam_mime, mp4_index FROM videos WHERE status = 'ready' AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 500"
+      `SELECT id, mime, cam_mime, json_remove(COALESCE(mp4_index, '{}'), '$.main.sidx', '$.cam.sidx') AS idx,
+         json_extract(mp4_index, '$.main.sidx') IS NOT NULL AS main_done, json_extract(mp4_index, '$.cam.sidx') IS NOT NULL AS cam_done
+       FROM videos WHERE status = 'ready' AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC`
     ).bind(Date.now()).all();
-    let n = 0;
+    let started = 0;
     for (const v of results) {
-      const idx = parseJson(v.mp4_index, {}) || {};
-      for (const [track, mime] of [['main', v.mime], ['cam', v.cam_mime]]) {
+      const idx = parseJson(v.idx, {}) || {};
+      for (const [track, mime, done] of [['main', v.mime, v.main_done], ['cam', v.cam_mime, v.cam_done]]) {
         const e = idx[track];
-        if (!mime || !/mp4/i.test(mime) || (e && (e.sidx || e.none || (e.pending && e.tries >= INDEX_TRIES)))) continue;
-        await indexTrack(env, v.id, track);
-        if (++n >= max) return;
+        if (done || !mime || !/mp4/i.test(mime)) continue;
+        if (e && (e.none || (e.pending && (e.tries >= INDEX_TRIES || Date.now() - e.since < 10 * 60e3)))) continue;
+        if ((await indexTrack(env, v.id, track)) && ++started >= max) return;
       }
     }
   } catch (e) { console.error('index backlog', e && e.message); }
@@ -895,7 +930,8 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self' https://fon
 
 // HTTPS only, remembered for a year. Not from local runs (HSTS = "0"): the preview shares a host
 // name with other services there. Sent by the Worker's own responses (every page load calls
-// /api/me); public/_headers can't be switched per environment, so it doesn't send it.
+// /api/me); public/_headers can't be switched per environment, so it doesn't send it. Set per
+// request from env, which is the same for every request an isolate serves.
 let hsts = false;
 
 function securityHeaders() {

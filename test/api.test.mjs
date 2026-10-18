@@ -569,6 +569,23 @@ try {
     assert.equal((await call(`/api/videos/${id}/transcript/retry`, { method: 'POST', anon: true })).status, 401);
   });
 
+  await test('logout clears the session and forgets the browser', async () => {
+    const r = await call('/api/logout', { method: 'POST', body: {} });
+    assert.equal(r.status, 200);
+    const sc = r.headers.get('set-cookie') || '';
+    assert.match(sc, /__Host-shuttle_session=; Path=\/; Max-Age=0/);
+    assert.match(sc, /__Host-shuttle_device=; Path=\/; Max-Age=0/);
+  });
+
+  await test('login addresses: IPv4 as is, IPv6 by /64, IPv4-mapped as IPv4', async () => {
+    const { loginNet } = await import('../src/worker.js');
+    assert.equal(loginNet('203.0.113.5'), '203.0.113.5');
+    for (const a of ['2001:db8:1:2::1', '2001:DB8:1:2:ffff::9', '2001:db8:1:2::1.2.3.4', '2001:0db8:0001:0002:0:0:0:1']) assert.equal(loginNet(a), '2001:db8:1:2::/64', a);
+    assert.equal(loginNet('::ffff:192.0.2.1'), '192.0.2.1');
+    assert.equal(loginNet('fe80::1%en0'), 'fe80:0:0:0::/64');
+    assert.equal(loginNet(null), 'local');
+  });
+
   await test('logout refuses cross-origin', async () => {
     assert.equal((await call('/api/logout', { method: 'POST', headers: { Origin: 'https://evil.example' } })).status, 403);
   });

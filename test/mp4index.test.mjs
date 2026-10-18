@@ -94,6 +94,23 @@ await t('a child running past its parent is ignored, not read', async () => {
   assert.ok(r === null || r.sidx, 'returned');
 });
 
+await t('fields read past a short box are refused, not taken from the next box', async () => {
+  // A tfhd that says it carries a default duration, with no room for it.
+  const shortTfhd = (time) => Buffer.concat([
+    box('moof', full('mfhd', 0, 0, u32(1)),
+      box('traf', full('tfhd', 0, 0x020008, u32(1)), full('tfdt', 1, 0, u64(time)), full('trun', 0, 5, u32(30), u32(0), u32(0x02000000)))),
+    box('mdat', Buffer.alloc(100)),
+  ]);
+  assert.equal((await timed(file(ftyp, moov, shortTfhd(0), shortTfhd(1)))).r, null);
+  // A version-1 tfdt with only four bytes of time.
+  const shortTfdt = (time) => Buffer.concat([
+    box('moof', full('mfhd', 0, 0, u32(1)),
+      box('traf', full('tfhd', 0, 0x020000, u32(1)), full('tfdt', 1, 0, u32(time)), full('trun', 0, 5, u32(30), u32(0), u32(0x02000000)))),
+    box('mdat', Buffer.alloc(100)),
+  ]);
+  assert.equal((await timed(file(ftyp, moov, shortTfdt(0), shortTfdt(1)))).r, null);
+});
+
 await t('a file cut off mid-fragment indexes what is complete, or nothing', async () => {
   for (let cut = good.length - 1; cut > good.length - 400; cut -= 7) {
     const { r } = await timed(good.subarray(0, cut));
