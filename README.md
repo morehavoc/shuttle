@@ -1,14 +1,33 @@
 # Shuttle
 
-Record your screen and camera, get a link. Styled after christophermoravec.com (teal on warm paper, Fira Sans / Noto Sans). A small Loom clone on Cloudflare: one Worker, an R2 bucket for video, a D1 database for metadata, Workers AI for transcripts. No build step.
+Record your screen and camera, get a link. Styled after christophermoravec.com (teal on warm paper, Fira Sans / Noto Sans). A small Loom clone on Cloudflare: one Worker, an R2 bucket for video, a D1 database for metadata, Workers AI for transcripts. No build step. MIT licensed.
+
+![A share page: the recording with the camera in a bubble, owner controls, and the transcript](docs/images/share-full.png)
+
+<table>
+<tr>
+<td width="50%"><img src="docs/images/setup.png" alt="New recording: Screen + cam, Screen or Camera, with camera and microphone pickers"><br><sub>Pick what to record, check your camera and mic.</sub></td>
+<td width="50%"><img src="docs/images/library.png" alt="The library of recordings"><br><sub>Your library: every recording with its length, size and expiry.</sub></td>
+</tr>
+<tr>
+<td><img src="docs/images/layout-side.png" alt="The Side layout: the screen framed, the camera beside it"><br><sub>Layouts are chosen after recording. This is Side.</sub></td>
+<td><img src="docs/images/embed.png" alt="A Shuttle video embedded in a blog post"><br><sub>Paste a link into Ghost (or anything that speaks oEmbed) and it embeds.</sub></td>
+</tr>
+</table>
+
+<p align="center"><img src="docs/images/phone.png" alt="A share page on an iPhone" width="280"><br><sub>The share page on a phone.</sub></p>
+
+Screenshots come from a real recording on a local server, made by `scripts/readme-shots.mjs` (the camera is a drawn stand-in).
 
 ## What it does
 
-- **Three modes:** screen + camera, screen only, camera only. Mic and tab/system audio are mixed in.
+- **Three modes:** screen + camera, screen only, camera only. Mic and tab/system audio are mixed in. **Start recording** waits until the camera is live and says so while it starts.
+- **Phones too.** iPhone Safari (iOS 27 and later) records the screen and the camera; an older phone records the camera only and says why. On a touch screen the recording bar is one full-width row of big labelled buttons, with Delete well away from Stop. iPhone Safari pauses the camera while another app is in front; the sound keeps recording.
 - **The camera is its own recording.** Screen + camera records two files side by side: the screen (with all the audio) and the camera. The share page composites them, so the camera never depends on a floating window being captured.
 - **Layouts**, picked per video on the share page and remembered for the next one: **Bubble** (round, any corner, S/M/L), **Card** (rounded portrait), **Side** (screen framed, camera beside it) and **Screen** (no camera; viewers can't fetch the camera file, its thumbnail or a preview with your face).
 - **Floating bubble** while recording: a self-view (Document Picture-in-Picture in Chrome/Edge, video PiP in Safari) with timer, pause, stop and delete. For a window or tab share it stays up. For a whole-screen share it closes when recording starts, and the on-page preview is hidden, so you aren't recorded twice.
 - **Instant link.** Both files upload in 5 MiB parts *while* you record. Stop copies the link and opens the share page a few seconds later.
+- **Fast start.** Browsers record MP4 as a chain of one-second fragments with no table of contents, so Chrome walks the whole chain before it plays or seeks. After Stop the server writes a fragment index (`sidx`, about 2 KB for 3 minutes) and splices it in front of the fragments as the file is served; the stored file never changes. "Complete" waits for it (up to 15 s), so the share page you land on starts at once, and each page keeps asking for the file the way it first got it (`?ix=0/1`), so an index that lands later never moves bytes under a playing video.
 - **Transcript** while you record: the audio is cut into half-minute chunks at quiet moments and transcribed as it goes. Chunk positions are measured against the recording, and word edges next to pauses are snapped to the audio.
 - **Description:** once the transcript is done, a title (only if you haven't renamed it) and a one- or two-sentence description are drafted for you; edit either in place, or **Write one for me** again. Your own text is never overwritten.
 - **Expiry:** each video keeps 7, 30 or 90 days, or forever (new recordings use your last choice; 30 days to start). Expired videos disappear at once and are deleted by an hourly cron (`[triggers]` in `wrangler.toml`).
@@ -21,6 +40,7 @@ Record your screen and camera, get a link. Styled after christophermoravec.com (
   - for the owner: rename, delete, layout and **Download** (screen and camera files).
 
   Viewers get no download button and never receive cut words.
+- **Embeds.** `/e/<id>` is the player alone, the only page another site may frame. The share page advertises an [oEmbed](https://oembed.com) endpoint (`/oembed?url=…`), so pasting a link into Ghost, WordPress or Notion turns it into the player. The owner's **Copy embed code** gives the `<iframe>` for an HTML card.
 - **Failure handling:**
   - A dropped connection pauses the upload and resumes it.
   - A server refusal shows up while you're still recording.
@@ -67,7 +87,8 @@ npm run dev                                       # migrations + wrangler dev --
 - `npm test` runs:
   - the timeline maths (19 checks);
   - the transcript post-processing (17);
-  - the API contract (44), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+  - the fragment index on hostile files (12);
+  - the API contract (50), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
 - `node test/e2e-mobile.mjs` is the phone run (WebKit, iPhone 15 emulation). An iOS 27 iPhone can record the screen: it records Screen + cam, Screen and Camera with the labelled phone recording bar (one row from 320 to 430 px wide), records again without a refresh (after deleting one, via Library, after Safari's back/forward cache brings the page back), never reloads under a recording that is starting or under way, and saves a recording whose recorder fails while paused. An older iPhone without screen capture gets a camera-only setup that says why, and a laptop keeps the compact bar. Same `BASE`/server as below.
 - `node test/e2e-first-view.mjs` is the first view right after a recording (WebKit and Chromium): a 3-minute recorder-style file plays and seeks while the server's fast-start index lands. `INDEX_DELAY_MS=6000 INDEX_WAIT_MS=1000 sh test/serve.sh` + `EXPECT=late` lands it after the page opened (the page keeps `?ix=0`); a plain `sh test/serve.sh` + `EXPECT=early` checks "complete" waited for it (`?ix=1`).
 - `node test/e2e-embed.mjs` is the embed run (WebKit and Chromium): a video plays inside another site's `<iframe>` of `/e/:id`, counts a view, the share page refuses to be framed, and the owner's Copy embed code copies the oEmbed iframe. Same `BASE`/server as below.
@@ -78,7 +99,7 @@ npm run dev                                       # migrations + wrangler dev --
   - `FAKE=1`: synthetic streams with a burnt-in time code, so camera/screen sync is checked frame by frame. WebKit always uses them, because Playwright can't grant camera permission on macOS.
   - `OFFSET_MS=700` (camera recorder starts late), `CAM_END=1` (camera dies mid-recording)
   - `SPEECH=1` (with a real transcriber): the fake mic speaks sentences. The run checks that transcript chunks sit where their audio is in the video, and that words line up with when they were said.
-- `npm test` also runs `test/mp4index.test.mjs`: the fragment index on hostile files (oversized counts, boxes and fragments, short fields, truncation, 3,000 random mutations). The API contract's login, upload-limit, If-Range and backlog-indexing checks came with it.
+- The fragment-index tests (`test/mp4index.test.mjs`) cover oversized counts, boxes and fragments, short fields, truncation, 3,000 random mutations, and that a long recording takes a few reads rather than one per fragment.
 
 ## Layout
 
@@ -93,7 +114,15 @@ public/pcm-tap.js    AudioWorklet: 16 kHz PCM for the transcript
 public/bubble.js     floating self-view (PiP)
 public/player.js     composite player: layouts, camera sync, cut skipping, captions
 public/share.js      share page: transcript, editing, owner controls
+public/embed.js      the embed page (/e/:id): the player alone
+public/export.js     "Screen and camera together": the composite recorded in the browser
 public/timeline.js   cuts and words (shared by the browser and the Worker)
 public/_headers      security headers for the static files (the Worker sets the same on its pages)
 migrations/          D1 schema
+scripts/             readme-shots.mjs: the README screenshots
+docs/images/         those screenshots
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Christopher Moravec
