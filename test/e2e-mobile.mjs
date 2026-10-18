@@ -54,6 +54,7 @@ async function open(name, { phone, screen }) {
       } });
     } else Object.defineProperty(md, 'getDisplayMedia', { value: undefined, configurable: true }); // iOS 26 and older
     Object.defineProperty(md, 'getUserMedia', { configurable: true, value: async (c) => {
+      if (c.video && window.__slowCam) await new Promise((r) => setTimeout(r, 2000)); // a camera taking its time
       const t = [];
       if (c.video) t.push(fakeVideo(720, 1280).getVideoTracks()[0]);
       if (c.audio) {
@@ -174,6 +175,21 @@ await run('iphone-ios27', { phone: true, screen: true }, async (t) => {
   const { page } = t;
   await t.signIn();
 
+  // ---------- Start waits for the camera ----------
+  await page.evaluate(() => { window.__slowCam = true; });
+  await page.click('#new-recording');
+  await page.waitForSelector('.sheet');
+  const early = await page.evaluate(() => { const b = document.querySelector('#start'); return { disabled: b.disabled, text: b.textContent, spin: !!b.querySelector('.spin-sm') }; });
+  await page.waitForFunction(() => { const v = document.querySelector('#setup-cam'); return v && v.videoWidth > 0; }, null, { timeout: 15000 });
+  const ready = await page.evaluate(() => { const b = document.querySelector('#start'); return { disabled: b.disabled, text: b.textContent }; });
+  check(early.disabled && early.spin && early.text === 'Starting camera…' && !ready.disabled && ready.text === 'Start recording',
+    'Start is disabled with "Starting camera…" until the camera is live', JSON.stringify({ early, ready }));
+  await page.click('.seg button[data-mode="screen"]');
+  check(!(await page.isDisabled('#start')), 'Screen only needs no camera: Start enabled');
+  await page.click('.seg button[data-mode="screen-camera"]');
+  await page.evaluate(() => { window.__slowCam = false; });
+  await page.click('.sheet [aria-label="Close"]');
+
   // ---------- setup: all three modes ----------
   await t.openSetup(null);
   await page.waitForTimeout(400);
@@ -272,11 +288,13 @@ await run('iphone-ios27', { phone: true, screen: true }, async (t) => {
   await page.waitForSelector('#library:not([hidden])');
   await t.openSetup('screen-camera');
   await t.startRecording();
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(4000); // long enough that both files hold data
   await page.click('.recbar [title="Pause"]');
   await page.waitForSelector('.recbar.paused');
   await page.evaluate(() => window.__recorders[window.__recorders.length - 1].dispatchEvent(new Event('error')));
-  await page.waitForURL(/\/v\//, { timeout: 30000 });
+  await page.waitForURL(/\/v\//, { timeout: 30000 }).catch(async (e) => {
+    throw new Error(`no share page after a paused failure; screen says: ${await page.evaluate(() => (document.querySelector('.finishing') || document.body).innerText.slice(0, 160))}`);
+  });
   const id = new URL(page.url()).pathname.split('/')[2];
   v = await page.evaluate(async (id) => (await fetch(`/api/videos/${id}`, { credentials: 'same-origin' })).json(), id);
   check(v.mode === 'screen-camera' && v.durationMs > 1000, 'a recording whose recorder fails while paused is saved, not stuck', JSON.stringify({ mode: v.mode, durationMs: v.durationMs }));
