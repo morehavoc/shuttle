@@ -232,11 +232,19 @@ async function acquireCamera() {
   setup.camMsg = '';
   if (setup.el) renderPreview();
   const id = store.get('cameraId', '');
+  const ask = () => navigator.mediaDevices.getUserMedia({
+    video: { deviceId: id ? { ideal: id } : undefined, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    audio: false,
+  });
   try {
-    setup.cameraStream = await navigator.mediaDevices.getUserMedia({
-      video: { deviceId: id ? { ideal: id } : undefined, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-      audio: false,
-    });
+    try { setup.cameraStream = await ask(); }
+    catch (e) {
+      // iPhone Safari can still be letting go of the last recording's camera: one more try.
+      if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError' || e.name === 'NotFoundError')) throw e;
+      await new Promise((r) => setTimeout(r, 1200));
+      if (!setup.el) return;
+      setup.cameraStream = await ask();
+    }
   } catch (e) {
     setup.cameraStream = null;
     setup.camMsg = cameraError(e);
@@ -301,7 +309,7 @@ async function fillDevices() {
 function cameraError(e) {
   if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError')) return 'Camera blocked — allow it in the browser.';
   if (e && e.name === 'NotFoundError') return 'No camera found.';
-  return 'Camera unavailable.';
+  return `Camera unavailable${e && e.name ? ` (${e.name})` : ''}. Close this and try again.`;
 }
 
 function stopStream(key) {
@@ -344,9 +352,13 @@ function onStart() {
   // Both of these must start synchronously inside the click.
   const displayP = session.requestDisplay();
   let bubble = null, bubbleP = Promise.resolve(false);
-  if (mode === 'screen-camera') {
+  // No floating bubble on a phone: it shares the whole screen, so the bubble would be put away
+  // at the countdown anyway, and iPhone Safari's picture-in-picture request can stay pending
+  // forever behind the system's screen-sharing sheet, which left recording never starting.
+  if (mode === 'screen-camera' && !matchMedia('(hover: none) and (pointer: coarse)').matches) {
     bubble = new Bubble(setup.cameraStream);
-    bubbleP = bubble.open(setupCam());
+    // A browser that never answers mustn't hold up the recording either.
+    bubbleP = Promise.race([bubble.open(setupCam()), new Promise((r) => setTimeout(() => r(false), 4000))]);
   }
   run(session, bubble, displayP, bubbleP);
 }
