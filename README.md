@@ -45,6 +45,8 @@ Deploys run only through GitHub Actions (`.github/workflows/deploy.yml`). The wo
 
 Then push to `main`, or go to **Actions → Deploy → Run workflow**. Until the secrets exist, the workflow runs the tests and skips the deploy. `SESSION_SECRET` is generated on the first deploy. The app answers at `https://shuttle.<your-subdomain>.workers.dev`. To serve it on your own hostname, add a fourth secret, `SHUTTLE_DOMAIN` (for example `videos.example.com`, no `https://`). The deploy adds it as a Workers Custom Domain, and Cloudflare creates the DNS record and certificate. The hostname's zone must be on the same Cloudflare account and must not already have a CNAME for it. Give the token zone access for that zone (Workers Routes Edit, DNS Edit, Zone Read). The `workers.dev` address keeps working too. Deleting the secret later doesn't detach the domain; remove it in the dashboard under the Worker's Domains & Routes.
 
+**Signing in.** Only Shuttle's own page can try a password (another site posting wrong ones from your browser can't lock you out). Each address gets 10 tries per 15 minutes; an IPv6 address counts as its whole /64. While more than 100 tries an hour fail, each address gets 3. Past 300 an hour, only a browser that has signed in before gets to try, so yours still works and a guesser's doesn't. Use a long random `OWNER_PASSWORD` all the same. Changing it signs every browser out.
+
 **Costs and limits.**
 - R2 gives 10 GB free, about 6 hours of 1080p screen recording at 3.5 Mbps; the camera file adds about a third. Egress is free.
 - Transcripts use `@cf/openai/whisper-large-v3-turbo`, run twice per half-minute chunk. One run is prompted to keep "um"s and one is plain, and the plain one guards against the prompted one inventing text. That is a fraction of a cent per recorded minute.
@@ -73,6 +75,7 @@ npm run dev                                       # migrations + wrangler dev --
   - `FAKE=1`: synthetic streams with a burnt-in time code, so camera/screen sync is checked frame by frame. WebKit always uses them, because Playwright can't grant camera permission on macOS.
   - `OFFSET_MS=700` (camera recorder starts late), `CAM_END=1` (camera dies mid-recording)
   - `SPEECH=1` (with a real transcriber): the fake mic speaks sentences. The run checks that transcript chunks sit where their audio is in the video, and that words line up with when they were said.
+- `npm test` also runs `test/mp4index.test.mjs`: the fragment index on hostile files (oversized counts, boxes and fragments, short fields, truncation, 3,000 random mutations). The API contract's login, upload-limit, If-Range and backlog-indexing checks came with it.
 
 ## Layout
 
