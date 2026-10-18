@@ -12,6 +12,14 @@ const store = {
 
 boot();
 
+// Safari keeps this page in its back/forward cache. Coming back to it after a recording
+// (Back from the share page) restores it exactly as it was left: under the "Finishing upload"
+// screen, with the finished session still current. Start it fresh instead.
+window.addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
+
+// No screen capture (a phone): camera only, so the setup and recording controls are simpler.
+if (!canRecordScreen()) document.documentElement.classList.add('camera-only');
+
 async function boot() {
   let me;
   try { me = await api('/api/me'); } catch { me = { owner: false }; }
@@ -167,7 +175,7 @@ function openSetup() {
         h('h2', {}, 'New recording'),
         h('button', { class: 'icon-btn', type: 'button', 'aria-label': 'Close', html: icon.close, onclick: closeSetup }),
       ),
-      seg,
+      screenOk ? seg : null,
       h('div', { class: 'preview', id: 'preview' }),
       h('div', { class: 'devices' },
         h('div', { class: 'device', id: 'cam-row' }, h('span', { html: icon.camera }), camSel, h('span')),
@@ -175,7 +183,7 @@ function openSetup() {
         h('div', { class: 'meter', 'aria-hidden': 'true', style: 'grid-column:auto' }, h('i', { id: 'meter' })),
       ),
       h('div', { class: 'sheet-foot' },
-        h('span', { class: 'note', id: 'setup-note' }, screenOk ? '' : 'Screen recording needs a computer.'),
+        h('span', { class: 'note', id: 'setup-note' }),
         startBtn,
       ),
     ),
@@ -458,7 +466,8 @@ function buildStage(session) {
   }
   const time = h('span', { class: 'time' }, '0:00');
   const up = h('span', { class: 'up' });
-  const pauseBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Pause', 'aria-label': 'Pause', html: icon.pause, onclick: () => {
+  // Icons with a word under them: on a phone there's no hover tooltip to say what they do.
+  const pauseBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Pause', 'aria-label': 'Pause', html: `${icon.pause}<b>Pause</b>`, onclick: () => {
     if (session.state === 'recording') session.pause(); else if (session.state === 'paused') session.resume();
   } });
   const bubbleBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Float camera', 'aria-label': 'Float camera', html: icon.bubble, hidden: true, onclick: async () => {
@@ -466,7 +475,7 @@ function buildStage(session) {
   } });
   const bar = h('div', { class: 'recbar', role: 'toolbar', 'aria-label': 'Recording' },
     h('span', { class: 'dot' }), time, up, pauseBtn, bubbleBtn,
-    h('button', { class: 'icon-btn', type: 'button', title: 'Delete', 'aria-label': 'Delete', html: icon.trash, onclick: () => discard(document) }),
+    h('button', { class: 'icon-btn rec-delete', type: 'button', title: 'Delete', 'aria-label': 'Delete', html: `${icon.trash}<b>Delete</b>`, onclick: () => discard(document) }),
     h('button', { class: 'stop', type: 'button', onclick: () => finish(document), html: `${icon.stop}Stop` }),
   );
   bar.hidden = true;
@@ -483,8 +492,9 @@ function buildStage(session) {
   session.addEventListener('state', () => {
     const paused = session.state === 'paused';
     bar.classList.toggle('paused', paused);
-    pauseBtn.innerHTML = paused ? icon.play : icon.pause;
+    pauseBtn.innerHTML = paused ? `${icon.play}<b>Resume</b>` : `${icon.pause}<b>Pause</b>`;
     pauseBtn.title = paused ? 'Resume' : 'Pause';
+    pauseBtn.setAttribute('aria-label', pauseBtn.title);
     if (current && current.bubble) current.bubble.setPaused(paused);
     if (!['recording', 'paused'].includes(session.state)) { clearInterval(interval); clearInterval(heartbeat); }
     // MediaRecorder died mid-recording: save what we have.
@@ -534,7 +544,7 @@ function buildStage(session) {
     countdown(n, bubble) {
       return new Promise((resolve) => {
         const span = h('span');
-        const el = h('div', { class: 'countdown', title: 'Click to cancel', onclick: () => done(false) }, span);
+        const el = h('div', { class: 'countdown', title: 'Click to cancel', onclick: () => done(false) }, span, h('small', {}, 'Tap to cancel'));
         document.body.append(el);
         let i = n, timer;
         const done = (ok) => {

@@ -200,6 +200,21 @@ a { color: inherit; }
 .recbar .stop:hover { background: #f25c5c; }
 .recbar .stop svg { width: 14px; height: 14px; }
 .recbar .up { font-size: 12px; color: #b3aea4; }
+.recbar .icon-btn b { display: none; }
+/* Camera-only (a phone): a full-width bar of big labelled buttons, Delete apart from Stop. */
+.camera-only .recbar {
+  left: 10px; right: 10px; transform: none; bottom: calc(10px + env(safe-area-inset-bottom));
+  padding: 10px 10px 10px 16px; gap: 6px; border-radius: 20px;
+}
+.camera-only .recbar .time { order: -1; font-size: 17px; margin-right: auto; }
+.camera-only .recbar .up:empty { display: none; }
+.camera-only .recbar .icon-btn { width: auto; height: 54px; min-width: 60px; padding: 0 8px; display: inline-grid; grid-template-rows: auto auto; gap: 3px; align-content: center; justify-items: center; }
+.camera-only .recbar .icon-btn svg { width: 22px; height: 22px; }
+.camera-only .recbar .icon-btn b { display: block; font-size: 11.5px; font-weight: 600; }
+.camera-only .recbar .rec-delete { order: -3; color: #ff8a80; margin-right: 6px; }
+.camera-only .recbar .dot { order: -2; }
+.camera-only .recbar .stop { height: 54px; padding: 0 20px; font-size: 17px; border-radius: 14px; }
+.camera-only .recbar .stop svg { width: 16px; height: 16px; }
 .stage { position: fixed; inset: 0; z-index: 55; background: #0e0e10; display: grid; place-items: center; }
 .stage > video { width: 100%; height: 100%; object-fit: contain; }
 .stage video.mirror { transform: scaleX(-1); }
@@ -217,6 +232,7 @@ a { color: inherit; }
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
 .countdown span { font-size: 140px; font-weight: 800; color: #fff; text-shadow: 0 10px 40px rgba(0, 0, 0, .5); animation: tick 1s ease forwards; }
+.countdown small { position: absolute; left: 0; right: 0; bottom: calc(40px + env(safe-area-inset-bottom)); text-align: center; font-size: 15px; color: rgba(255, 255, 255, .8); }
 .finishing { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: var(--bg); }
 .finishing .box { text-align: center; display: grid; gap: 14px; justify-items: center; }
 .progress { width: 260px; height: 6px; border-radius: 6px; background: var(--line); overflow: hidden; }
