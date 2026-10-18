@@ -2,7 +2,7 @@ import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
 import { Player } from './player.js';
 import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
-  withTrim,
+  toSource, withTrim,
 } from './timeline.js';
 
 const { video: v, owner, ownerName } = JSON.parse(document.getElementById('shuttle-data').textContent);
@@ -280,9 +280,7 @@ function trimRow() {
     // Inside the edge nothing is trimmed yet; the handle stays where it was let go (re-reading
     // the trim would put it back at the end, and arrow keys could never step out of the edge).
     if (next.start === trim.start && next.end === trim.end) return;
-    const moved = next.start !== trim.start;
     apply(cuts, next.start > 0 || next.end !== null ? 'Trimmed' : 'Trim removed', { trim: next });
-    if (moved) retakeThumbs();
   }
   onCutsChanged = sync;
   for (const ev of ['loadedmetadata', 'durationchange']) player.main.addEventListener(ev, sync); // the real length may arrive later
@@ -292,18 +290,23 @@ function trimRow() {
 }
 
 // The poster and the link preview are taken 3 s into the recording, which is just what a start
-// trim cuts off. Take them again from the new start, from hidden copies of the video so the
-// player doesn't move. Best effort: on any failure the old pictures stay.
-let thumbsJob = 0;
-async function retakeThumbs() {
+// trim cuts off. Take them again from the new start (the first frame that plays), from hidden
+// copies of the video so the player doesn't move. One at a time, newest last, so an older
+// picture can never land after a newer one. Best effort: on a failure the old pictures stay.
+let thumbsJob = 0, thumbsChain = Promise.resolve();
+function retakeThumbs() {
   const job = ++thumbsJob;
-  await new Promise((r) => setTimeout(r, 800)); // a run of changes takes one picture
-  if (job !== thumbsJob) return;
+  thumbsChain = thumbsChain.then(() => new Promise((r) => setTimeout(r, 800))).then(() => job === thumbsJob && takeThumbs(job));
+}
+
+async function takeThumbs(job) {
   const els = [];
   try {
     const { makeThumbs } = await import('./recorder.js');
-    const end = trim.end === null ? duration() : trim.end;
-    const t = Math.max(0, Math.min(trim.start > 0 ? trim.start + 0.5 : 3, end - 0.2));
+    const play = playCuts(), d = duration();
+    // Half a second into what plays after a trim; 3 s in without one, like the recorder.
+    const total = editedDuration(play, d);
+    const t = toSource(Math.max(0, Math.min(trim.start > 0 ? 0.5 : 3, total - 0.2)), play, d);
     const frame = async (src, at) => {
       const el = h('video', { muted: true, playsinline: true, preload: 'auto', class: 'offscreen' });
       els.push(el);
@@ -317,12 +320,16 @@ async function retakeThumbs() {
     };
     const main = await frame(`/raw/${v.id}`, t);
     const cam = player.cam ? await frame(`/raw/${v.id}/cam`, t - (v.camOffsetMs || 0) / 1000) : null;
-    if (job !== thumbsJob) return;
     const camera = v.mode === 'camera';
     const thumbs = await makeThumbs({ screenVideo: camera ? null : main, cameraVideo: camera ? main : cam, mode: v.mode, layout: player.hasCam ? player.layout : null });
     for (const [variant, blob] of Object.entries(thumbs)) {
       if (!blob || job !== thumbsJob) continue;
-      await fetch(`/api/videos/${v.id}/thumb?variant=${variant}`, { method: 'PUT', body: blob, credentials: 'same-origin' });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20000);
+      try {
+        const res = await fetch(`/api/videos/${v.id}/thumb?variant=${variant}`, { method: 'PUT', body: blob, credentials: 'same-origin', signal: ctrl.signal });
+        if (!res.ok) throw new Error(`${variant}: HTTP ${res.status}`);
+      } finally { clearTimeout(timer); }
     }
   } catch (e) {
     console.warn('thumbnails not retaken:', e && e.message);
@@ -536,7 +543,9 @@ function apply(next, message, { record = true, trim: nextTrim = trim } = {}) {
     if (undoStack.length > 100) undoStack.shift();
   }
   cuts = normalizeCuts(next, duration());
+  const startMoved = nextTrim.start !== trim.start;
   trim = nextTrim;
+  if (startMoved) retakeThumbs(); // by a handle, Reset or Undo
   const play = playCuts();
   player.setCuts(play);
   for (let i = 0; i < words.length; i++) {

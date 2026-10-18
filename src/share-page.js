@@ -4,11 +4,11 @@
 
 import { editedDuration, withTrim } from '../public/timeline.js';
 
-export function renderSharePage(v, { owner, origin, ownerName, version = 0 }) {
+export function renderSharePage(v, { owner, origin, ownerName }) {
   const page = `${origin}/v/${v.id}`;
   // Versioned by layout and by the last change: unfurlers cache images by URL, the Screen
   // layout's preview has no face, and a start trim takes the picture again.
-  const ogImage = `${origin}/thumb/${v.id}/og.jpg?l=${v.layout && v.layout.kind === 'screen' ? 's' : 'c'}${version ? `&v=${version}` : ''}`;
+  const ogImage = `${origin}/thumb/${v.id}/og.jpg?l=${v.layout && v.layout.kind === 'screen' ? 's' : 'c'}${v.rev ? `&v=${v.rev}` : ''}`;
   const ready = v.status === 'ready';
   const d = (v.durationMs || 0) / 1000;
   const dur = d ? fmtDuration(editedDuration(withTrim(v.cuts, v.trim, d), d) * 1000) : '';
