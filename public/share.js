@@ -2,7 +2,7 @@ import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
 import { Player } from './player.js';
 import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
-  trimCuts, withTrim,
+  withTrim,
 } from './timeline.js';
 
 const { video: v, owner, ownerName } = JSON.parse(document.getElementById('shuttle-data').textContent);
@@ -226,11 +226,16 @@ let onCutsChanged = null;
 function trimRow() {
   const MIN = 1; // seconds that must stay between the handles
   const EDGE = 0.1; // a handle this close to its end is no trim (the slider rounds to its step)
+  const timers = { lo: 0, hi: 0 }; // a handle's save waiting to happen
   const lo = h('input', { type: 'range', class: 'trim-lo', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim start' });
   const hi = h('input', { type: 'range', class: 'trim-hi', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim end' });
   const fill = h('div', { class: 'trim-fill' });
   const label = h('span', { class: 'row-note trim-label' });
-  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => setTrim({ start: 0, end: null }) }, 'Reset');
+  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => {
+    for (const k of ['lo', 'hi']) { clearTimeout(timers[k]); timers[k] = 0; } // a move not saved yet goes too
+    setTrim({ start: 0, end: null });
+    sync();
+  } }, 'Reset');
   const paint = (s, e) => {
     const d = duration() || 1;
     fill.style.left = `${(s / d) * 100}%`;
@@ -240,13 +245,13 @@ function trimRow() {
     // The handles overlap when they are close; the one on top is the one that can still move.
     lo.classList.toggle('on-top', s + e > d);
   };
+  // Draws the saved trim. A handle moved but not saved yet keeps its place (its save is on the way).
   const sync = () => {
     const d = duration();
     lo.max = hi.max = String(d);
-    const s = Math.min(trim.start, d), e = trim.end === null ? d : Math.min(trim.end, d);
-    lo.value = String(s);
-    hi.value = String(e);
-    paint(s, e);
+    if (!timers.lo) lo.value = String(Math.min(trim.start, d));
+    if (!timers.hi) hi.value = String(trim.end === null ? d : Math.min(trim.end, d));
+    paint(Number(lo.value), Number(hi.value));
   };
   lo.addEventListener('input', () => {
     const e = Number(hi.value), s = Math.max(0, Math.min(Number(lo.value), e - MIN));
@@ -262,8 +267,7 @@ function trimRow() {
   });
   // Saved when let go, or once the arrow keys pause: one Undo step and one toast per adjustment.
   // Only the handle that moved changes.
-  const timers = {};
-  const later = (k, fn) => { clearTimeout(timers[k]); timers[k] = setTimeout(fn, 300); };
+  const later = (k, fn) => { clearTimeout(timers[k]); timers[k] = setTimeout(() => { timers[k] = 0; fn(); }, 300); };
   lo.addEventListener('change', () => later('lo', () => {
     const s = Number(lo.value);
     setTrim({ ...trim, start: s <= EDGE ? 0 : s });
@@ -331,6 +335,7 @@ let editing = false;
 let undoStack = [];
 let saveTimer = 0;
 let wordEls = [];
+let stamps = []; // paragraph start times: { el, s }
 let activeIdx = -1;
 let toRetry = 0; // chunks the last transcript load said could be tried again
 
@@ -386,18 +391,21 @@ function renderWords() {
   const body = $('#tc-body');
   if (!body) return;
   wordEls = [];
-  const play = playCuts(), trimmed = trimCuts(trim);
+  stamps = [];
+  const play = playCuts();
   const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], play));
   const paras = paragraphs(visible.map((i) => words[i]));
   body.replaceChildren(...paras.map((idxs) => {
     const first = words[visible[idxs[0]]];
-    const p = h('p', { class: 'tc-p' }, h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, play)) * 1000)));
+    const ts = h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, play)) * 1000));
+    stamps.push({ el: ts, s: first.s });
+    const p = h('p', { class: 'tc-p' }, ts);
     for (const k of idxs) {
       const i = visible[k];
       const w = words[i];
       const span = h('span', { class: 'w', 'data-i': String(i) }, w.w);
       if (isWordCut(w, cuts)) span.classList.add('cut');
-      else if (isWordCut(w, trimmed)) span.classList.add('trimmed');
+      else if (isWordCut(w, play)) span.classList.add('trimmed'); // skipped, but not by a cut
       wordEls[i] = span;
       p.append(span, ' ');
     }
@@ -444,7 +452,7 @@ function renderEditTools(tools) {
   const editBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setEditing(!editing) }, 'Edit');
   const extra = h('div', { class: 'tc-edit-tools', hidden: true },
     h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(fillerCuts(words, duration())), 'Filler words removed') }, 'Remove ums'),
-    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(pauseCuts(words, playCuts(), duration())), 'Pauses shortened') }, 'Shorten pauses'),
+    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(insideTrim(pauseCuts(words, playCuts(), duration()))), 'Pauses shortened') }, 'Shorten pauses'),
     h('button', { class: 'btn btn-sm', type: 'button', id: 'undo', onclick: undo, disabled: true }, 'Undo'),
     h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], hasTrim() ? 'All cuts restored (the trim stays)' : 'All edits removed') }, 'Restore all'),
   );
@@ -457,6 +465,13 @@ function renderEditTools(tools) {
     $('#tc-body').classList.toggle('editing', on);
     if (!on) hideSelTools();
   }
+}
+
+// Pause cuts run from the start or to the end when the silence does; inside a trim they stop at
+// it, so taking the trim off later brings back what only the trim had hidden.
+function insideTrim(ranges) {
+  const end = trim.end === null ? Infinity : trim.end;
+  return ranges.map(([s, e]) => [Math.max(s, trim.start), Math.min(e, end)]).filter(([s, e]) => e > s);
 }
 
 function addAll(ranges) {
@@ -472,14 +487,15 @@ function apply(next, message, { record = true, trim: nextTrim = trim } = {}) {
   }
   cuts = normalizeCuts(next, duration());
   trim = nextTrim;
-  player.setCuts(playCuts());
-  const trimmed = trimCuts(trim);
+  const play = playCuts();
+  player.setCuts(play);
   for (let i = 0; i < words.length; i++) {
     if (!wordEls[i]) continue;
     const cut = isWordCut(words[i], cuts);
     wordEls[i].classList.toggle('cut', cut);
-    wordEls[i].classList.toggle('trimmed', !cut && isWordCut(words[i], trimmed));
+    wordEls[i].classList.toggle('trimmed', !cut && isWordCut(words[i], play));
   }
+  for (const { el, s } of stamps) el.textContent = fmtDuration(Math.max(0, toEdited(s, play)) * 1000);
   const undoBtn = $('#undo');
   if (undoBtn) undoBtn.disabled = !undoStack.length;
   renderWhen();
@@ -495,13 +511,18 @@ function undo() {
   apply(prev.cuts, 'Undone', { record: false, trim: prev.trim });
 }
 
-let savedTrim = JSON.stringify(trim);
+// One save at a time, each with the whole edit state as it is when it goes, so a slow save can't
+// land after a newer one (an Undo during a save used to leave the server with what was undone).
+let saving = false, saveAgain = false;
 async function save() {
-  const body = { cuts };
-  const t = JSON.stringify(trim);
-  if (t !== savedTrim) body.trim = hasTrim() ? trim : null;
-  try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body }); savedTrim = t; }
-  catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+  if (saving) { saveAgain = true; return; }
+  saving = true;
+  do {
+    saveAgain = false;
+    try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts, trim: hasTrim() ? trim : null } }); }
+    catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+  } while (saveAgain);
+  saving = false;
 }
 
 // One pass over the chunks that need it (the server hands out four at a time, least recently

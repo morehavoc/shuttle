@@ -580,6 +580,20 @@ try {
     const hiVal = await page.evaluate(() => Number(document.querySelector('.trim-hi').value));
     check(saved.trim && Math.abs(saved.trim.end - hiVal) < 0.06 && Math.abs(d - hiVal - 1) < 0.15 && Math.abs(saved.trim.start - trimStart) < 0.06 && JSON.stringify(saved.cuts) === cutsBefore,
       `end trim saved (${saved.trim && saved.trim.end} s, 1 s off the end), start and cuts kept`, `end trim: handle ${hiVal}, trim ${JSON.stringify(saved.trim)}, cuts ${JSON.stringify(saved.cuts)} of ${d}`);
+    if (nWords) {
+      // A run of arrow keys is one Undo step (Undo lives in the transcript's Edit mode).
+      await page.click('.tc-tools >> text=Edit');
+      await page.click('.tc-edit-tools >> text=Undo');
+      await page.waitForTimeout(900);
+      const undone = await videoNow();
+      check(undone.trim && undone.trim.end === null && Math.abs(undone.trim.start - trimStart) < 0.06 && JSON.stringify(undone.cuts) === cutsBefore,
+        'one Undo takes back the whole run of arrow keys', `after Undo: trim ${JSON.stringify(undone.trim)}, cuts ${JSON.stringify(undone.cuts)}`);
+      await page.click('.tc-tools >> text=Done');
+      await page.focus('.trim-hi');
+      for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+      await page.waitForTimeout(1200);
+      saved = await videoNow();
+    }
     const { editedDuration, withTrim } = await import('../public/timeline.js');
     const want = editedDuration(withTrim(saved.cuts, saved.trim, d), d), shown = await total();
     check(Math.abs(shown - want) <= 1, `player length follows the trim (${shown} s)`, `player shows ${shown} s, cuts and trim give ${want.toFixed(2)} s`);
