@@ -62,6 +62,9 @@ async function open(name, { phone, screen }) {
       }
       return new MediaStream(t);
     } });
+    // Picture-in-picture that never answers, as iPhone Safari did behind the screen-sharing sheet.
+    Object.defineProperty(Document.prototype, 'pictureInPictureEnabled', { configurable: true, get: () => true });
+    HTMLVideoElement.prototype.requestPictureInPicture = () => new Promise(() => {});
     const start = MediaRecorder.prototype.start; // kept, so a test can make one fail
     MediaRecorder.prototype.start = function (...a) { (window.__recorders = window.__recorders || []).push(this); return start.apply(this, a); };
     Object.defineProperty(md, 'enumerateDevices', { configurable: true, value: async () => [
@@ -295,8 +298,10 @@ await run('iphone-ios26', { phone: true, screen: false }, async (t) => {
 await run('laptop', { phone: false, screen: true }, async (t) => {
   const { page } = t;
   await t.signIn();
-  await t.openSetup('camera');
+  await t.openSetup('screen-camera');
+  const t0 = Date.now();
   const hint = await t.startRecording();
+  check(Date.now() - t0 < 15000, 'laptop: a floating bubble that never opens doesn’t stop the recording starting', `${Date.now() - t0} ms`);
   check(hint === null, 'laptop: no "Tap to cancel" on the countdown', `countdown hint ${hint}`);
   await page.waitForTimeout(500);
   await t.shot('1-recording.png');
