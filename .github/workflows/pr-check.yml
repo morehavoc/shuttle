@@ -34,5 +34,7 @@ jobs:
             -c:v libx264 -b:v 3M -pix_fmt yuv420p -c:a aac -movflags frag_keyframe+empty_moov test/out/sample.mp4
       - name: API tests (wrangler dev, local R2 + D1)
         run: npm test
+      # Everything here is a dev dependency (wrangler and what it pulls in), and it runs in the
+      # deploy job next to the secrets, so the whole tree is audited, not just runtime packages.
       - name: npm audit (report only; the weekly review compares it to main)
-        run: npm audit --omit=dev || true
+        run: npm audit || true

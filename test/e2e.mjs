@@ -590,21 +590,37 @@ try {
   const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
   check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
 
-  // The served files carry a fragment index (sidx) so Chrome starts them in one or two
-  // requests instead of reading every fragment first (built in the background after complete).
+  // A served file with more than one fragment carries a fragment index (sidx) in front of the
+  // first, so Chrome starts it in one or two requests instead of reading every fragment first
+  // (built in the background after complete). A short recording can be a single fragment, with
+  // nothing to index; the API test covers the index itself byte for byte.
   {
-    const hasIndex = async (track) => {
+    const topBoxes = (buf) => {
+      const boxes = [];
+      for (let o = 0; o + 8 <= buf.length;) {
+        let size = buf.readUInt32BE(o);
+        if (size === 1) size = Number(buf.readBigUInt64BE(o + 8));
+        else if (size === 0) size = buf.length - o;
+        if (size < 8) break;
+        boxes.push(buf.toString('latin1', o + 4, o + 8));
+        o += size;
+      }
+      return boxes;
+    };
+    const indexState = async (track) => {
+      let boxes = [];
       for (let i = 0; i < 50; i++) {
-        const buf = Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`, { headers: { Range: 'bytes=0-8191' } })).body());
-        if (buf.includes(Buffer.from('sidx'))) return true;
+        boxes = topBoxes(Buffer.from(await (await page.request.get(`${BASE}/raw/${meta.id}${track}`)).body()));
+        const moofs = boxes.filter((b) => b === 'moof').length, at = boxes.indexOf('sidx');
+        if (moofs < 2) return { track: track || 'main', moofs, ok: at < 0 };
+        if (at >= 0) return { track: track || 'main', moofs, ok: boxes[at + 1] === 'moof' };
         await page.waitForTimeout(100);
       }
-      return false;
+      return { track: track || 'main', ok: false, boxes: boxes.slice(0, 6) };
     };
-    const tracks = meta.hasCam ? ['', '/cam'] : [''];
-    const found = [];
-    for (const t of tracks) found.push(await hasIndex(t));
-    check(found.every(Boolean), `served file${tracks.length > 1 ? 's carry' : ' carries'} a fragment index`, `no fragment index: ${JSON.stringify(found)}`);
+    const states = [];
+    for (const t of meta.hasCam ? ['', '/cam'] : ['']) states.push(await indexState(t));
+    check(states.every((x) => x.ok), `served files: fragment index wherever there is more than one fragment (${states.map((x) => `${x.track} ${x.moofs} fragment${x.moofs === 1 ? '' : 's'}`).join(', ')})`, `fragment index: ${JSON.stringify(states)}`);
   }
 
   // ---------- what a viewer sees ----------

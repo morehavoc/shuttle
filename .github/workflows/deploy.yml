@@ -29,6 +29,9 @@ permissions:
 
 jobs:
   deploy:
+    # Only main deploys. "Run workflow" offers any branch, and without this a branch nobody
+    # reviewed could go live (and run with the Cloudflare secrets).
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

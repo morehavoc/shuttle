@@ -41,6 +41,9 @@ name = "shuttle-local"
 
 [env.local.vars]
 OWNER_NAME = "Christopher Moravec"
+# No Strict-Transport-Security here: it would pin HTTPS on every port of the host the preview
+# runs on (jaws-mini's tailnet name) for a year.
+HSTS = "0"
 
 [[env.local.r2_buckets]]
 binding = "VIDEOS"

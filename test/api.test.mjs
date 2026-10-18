@@ -28,7 +28,7 @@ async function startServer() {
   rmSync(path.join(root, '.wrangler/test-state'), { recursive: true, force: true });
   execFileSync('npx', ['wrangler', 'd1', 'migrations', 'apply', 'shuttle', '--local', '--env', 'local', '--persist-to', '.wrangler/test-state'], { cwd: root, stdio: 'ignore', env: cleanEnv() });
   server = spawn('npx', ['wrangler', 'dev', '--env', 'local', '--port', String(PORT), '--ip', '127.0.0.1', '--persist-to', '.wrangler/test-state',
-    '--var', `OWNER_PASSWORD:${PASSWORD}`, '--var', 'TRANSCRIBE_FAKE:1', '--show-interactive-dev-session=false'],
+    '--var', `OWNER_PASSWORD:${PASSWORD}`, '--var', 'TRANSCRIBE_FAKE:1', '--var', 'HSTS:1', '--test-scheduled', '--show-interactive-dev-session=false'],
   { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: cleanEnv() });
   let log = '';
   server.stdout.on('data', (d) => { log += d; });
@@ -42,6 +42,7 @@ async function startServer() {
 function stopServer() { if (server) { try { process.kill(-server.pid, 'SIGTERM'); } catch {} } }
 
 let cookie = '';
+let device = '';
 async function call(p, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (cookie && !opts.anon) headers.Cookie = cookie;
@@ -98,6 +99,12 @@ try {
     assert.doesNotMatch(sc, /Domain=/i);
     cookie = sc.split(';')[0];
     assert.equal((await j(await call('/api/me'))).owner, true);
+    // A second cookie marks this browser as one that has signed in (it keeps login open to it
+    // during a flood); on its own it is not a session.
+    device = (sc.match(/__Host-shuttle_device=\d+\.[\w-]+/) || [''])[0];
+    assert.ok(device, `device cookie in: ${sc}`);
+    assert.match(sc, /__Host-shuttle_device=[^,]*HttpOnly; Secure; SameSite=Lax/);
+    assert.equal((await j(await call('/api/me', { anon: true, headers: { Cookie: device } }))).owner, false);
   });
 
   await test('forged cookie is refused', async () => {
@@ -137,7 +144,7 @@ try {
   });
 
   await test('oversize part and bad track refused', async () => {
-    assert.equal((await call(`/api/videos/${id}/parts/1`, { method: 'PUT', body: new Uint8Array(PART + 1) })).status, 400);
+    assert.equal((await call(`/api/videos/${id}/parts/1`, { method: 'PUT', body: new Uint8Array(PART + 1) })).status, 413);
     assert.equal((await call(`/api/videos/${id}/parts/1?track=evil`, { method: 'PUT', body: new Uint8Array(10) })).status, 400);
   });
 
@@ -190,6 +197,7 @@ try {
       assert.equal(r.status, 200);
     }
     assert.equal((await call(`/api/videos/${id}/thumb?variant=evil`, { method: 'PUT', body: new Uint8Array(jpg) })).status, 400);
+    assert.equal((await call(`/api/videos/${id}/thumb?variant=poster`, { method: 'PUT', body: new Uint8Array(2 * 1024 * 1024 + 1) })).status, 413, 'no thumbnail over 2 MB');
     assert.equal((await call(`/thumb/${id}.jpg`, { anon: true })).headers.get('content-type'), 'image/jpeg');
     assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).headers.get('content-type'), 'image/jpeg');
     // og falls back to the poster until it exists
@@ -247,6 +255,14 @@ try {
     assert.equal(r.status, 206);
     assert.equal(r.headers.get('content-range'), 'bytes 10-19/300000');
     assert.equal((await call(`/raw/${id}`, { anon: true, headers: { Range: `bytes=${sample.length}-` } })).status, 416);
+    // A resumed download for a file that has changed since (If-Range) gets the whole file.
+    const etag = (await call(`/raw/${id}`, { anon: true, method: 'HEAD' })).headers.get('etag');
+    r = await call(`/raw/${id}`, { anon: true, headers: { Range: 'bytes=0-99', 'If-Range': etag } });
+    assert.equal(r.status, 206, 'same file: the range');
+    r = await call(`/raw/${id}`, { anon: true, headers: { Range: 'bytes=0-99', 'If-Range': '"something-else"' } });
+    assert.equal(r.status, 200, 'changed file: all of it');
+    assert.equal(Number(r.headers.get('content-length')), sample.length);
+    await r.arrayBuffer();
   });
 
   await test('downloads are the owner’s only', async () => {
@@ -339,6 +355,7 @@ try {
       assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/, p);
       assert.equal(r.headers.get('x-content-type-options'), 'nosniff', p);
       assert.equal(r.headers.get('referrer-policy'), 'strict-origin-when-cross-origin', p);
+      if (!['/', '/index.html', '/app.js'].includes(p)) assert.equal(r.headers.get('strict-transport-security'), 'max-age=31536000', p); // the Worker's responses
     }
     assert.equal((await call('/_headers', { anon: true })).status, 404, 'the _headers file itself is not served');
   });
@@ -351,6 +368,7 @@ try {
     await call(`/api/videos/${id}/view`, { method: 'POST', anon: true });
     await call(`/api/videos/${id}/view`, { method: 'POST', anon: true });
     await call(`/api/videos/${id}/view`, { method: 'POST' });
+    assert.equal((await call(`/api/videos/${id}/view`, { method: 'POST', anon: true, headers: { Origin: 'https://evil.example' } })).status, 403, 'another site can\'t count views');
     assert.equal((await j(await call(`/api/videos/${id}`))).views, 2);
   });
 
@@ -452,6 +470,20 @@ try {
     assert.ok(Math.abs(dur(out) - dur(frag)) < 0.05, `duration ${dur(out)} vs ${dur(frag)}`);
     // A stored file that can't be indexed (absolute offsets) is served exactly as stored.
     assert.equal(Number((await call(`/raw/${id}`, { method: 'HEAD', anon: true })).headers.get('content-length')), sample.length);
+    // A recording from before indexing: viewers' requests don't build its index (no work on
+    // their say-so); the hourly job does.
+    execFileSync('npx', ['wrangler', 'd1', 'execute', 'shuttle', '--local', '--env', 'local', '--persist-to', '.wrangler/test-state',
+      '--command', `UPDATE videos SET mp4_index = NULL WHERE id = '${c.id}'`], { cwd: root, stdio: 'ignore', env: cleanEnv() });
+    for (let i = 0; i < 3; i++) await (await call(`/raw/${c.id}`, { anon: true, headers: { Range: 'bytes=0-99' } })).arrayBuffer();
+    await new Promise((res) => setTimeout(res, 1500));
+    assert.equal(Number((await call(`/raw/${c.id}`, { method: 'HEAD', anon: true })).headers.get('content-length')), file.length, 'viewers served it as stored, unindexed');
+    assert.equal((await call('/__scheduled?cron=0+*+*+*+*', { anon: true })).status, 200);
+    len = 0;
+    for (let i = 0; i < 60 && len !== expected.length; i++) {
+      len = Number((await call(`/raw/${c.id}`, { method: 'HEAD', anon: true })).headers.get('content-length'));
+      if (len !== expected.length) await new Promise((res) => setTimeout(res, 100));
+    }
+    assert.equal(len, expected.length, 'the hourly job indexed it');
     await call(`/api/videos/${c.id}`, { method: 'DELETE' });
   });
 
@@ -547,7 +579,8 @@ try {
     assert.equal((await call(`/raw/${id}/cam`, { anon: true })).status, 404);
     assert.equal((await call(`/v/${id}`, { anon: true })).status, 404);
     assert.equal((await call(`/api/videos/${id}/transcript`, { anon: true })).status, 404);
-    assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).headers.get('content-type'), 'image/svg+xml');
+    assert.equal((await call(`/thumb/${id}/cam.jpg`, { anon: true })).status, 404);
+    assert.equal((await call(`/thumb/${id}.jpg`, { anon: true })).status, 404);
   });
 
   await test('login is throttled after repeated failures', async () => {
@@ -572,6 +605,24 @@ try {
     assert.equal((await login('nope', '198.51.100.8')).status, 401, 'another address is not');
   });
 
+  await test('login refuses other sites, non-JSON and oversized bodies, and none of them count', async () => {
+    const ip = '192.0.2.70';
+    for (let i = 0; i < 4; i++) {
+      assert.equal((await call('/api/login', { method: 'POST', anon: true, body: { password: 'x' }, headers: { 'CF-Connecting-IP': ip, Origin: 'https://evil.example' } })).status, 403);
+      assert.equal((await call('/api/login', { method: 'POST', anon: true, body: JSON.stringify({ password: 'x' }), headers: { 'CF-Connecting-IP': ip, 'Content-Type': 'text/plain' } })).status, 415);
+      assert.equal((await call('/api/login', { method: 'POST', anon: true, body: { password: 'x'.repeat(5000) }, headers: { 'CF-Connecting-IP': ip } })).status, 413);
+    }
+    assert.equal((await login(PASSWORD, ip)).status, 200, '12 refusals later the address still signs in');
+  });
+
+  await test('IPv6 addresses in one /64 share an allowance', async () => {
+    const rs = await Promise.all(Array.from({ length: 14 }, (_, i) => login('v6-' + i, `2001:db8:5:6::${(i + 1).toString(16)}`)));
+    const st = rs.map((r) => r.status);
+    assert.ok(st.filter((x) => x === 401).length <= 10, `${st}`);
+    assert.ok(st.filter((x) => x === 429).length >= 4, `${st}`);
+    assert.equal((await login('v6', '2001:db8:5:7::1')).status, 401, 'the next /64 is not locked');
+  });
+
   await test('a flood from many addresses never locks out the right password', async () => {
     // 11 + 1 failures so far from this run's other tests; push the last hour past 100.
     for (let a = 1; a <= 10; a++) await Promise.all(Array.from({ length: 10 }, (_, i) => login('flood' + i, `203.0.113.${a}`)));
@@ -583,6 +634,18 @@ try {
     for (let i = 0; i < 5; i++) st.push((await login('guess' + i, '192.0.2.60')).status);
     assert.deepEqual(st, [401, 401, 401, 429, 429]);
     assert.equal((await login(PASSWORD, '192.0.2.60')).status, 429, 'the per-address cap is still the hard stop');
+  });
+
+  await test('a flood past 300 an hour checks passwords only from browsers that signed in before', async () => {
+    // Three checked failures from each of 70 addresses (the flood allowance) take the hour past 300.
+    for (let b = 0; b < 70; b += 10) {
+      await Promise.all(Array.from({ length: 10 }, (_, k) => Promise.all(Array.from({ length: 3 }, (_, i) => login('big' + i, `198.18.0.${b + k}`)))));
+    }
+    assert.equal((await login(PASSWORD, '192.0.2.80')).status, 429, 'a new browser waits, right password or not');
+    const known = await call('/api/login', { method: 'POST', anon: true, body: { password: PASSWORD }, headers: { 'CF-Connecting-IP': '192.0.2.81', Cookie: device } });
+    assert.equal(known.status, 200, 'his own browser still signs in');
+    const forged = await call('/api/login', { method: 'POST', anon: true, body: { password: PASSWORD }, headers: { 'CF-Connecting-IP': '192.0.2.82', Cookie: device.replace(/\.\w/, '.A') } });
+    assert.equal(forged.status, 429, 'a forged device cookie does not');
   });
 
   await test('static app is served', async () => {

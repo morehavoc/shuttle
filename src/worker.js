@@ -19,6 +19,13 @@ const COOKIE = '__Host-shuttle_session';
 const LOGIN_PER_IP = 10; // password checks per address per 15 minutes
 const LOGIN_PER_IP_FLOOD = 3; // ... while more than LOGIN_GLOBAL failures came in the last hour
 const LOGIN_GLOBAL = 100;
+const LOGIN_GLOBAL_HARD = 300; // ... and past this many, only a browser that has signed in before is checked
+const DEVICE_COOKIE = '__Host-shuttle_device'; // marks a browser that has signed in; never a session
+const DEVICE_DAYS = 365;
+const MAX_JSON = 1024 * 1024; // the largest edit (5,000 cuts) is ~100 KB
+const MAX_LOGIN_JSON = 4096;
+const MAX_THUMB = 2 * 1024 * 1024;
+const INDEX_TRIES = 3; // fragment-index builds per file before giving up (a build can be killed)
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ALLOWED_MIME = /^video\/(webm|mp4|x-matroska|quicktime)(;.*)?$/i;
 const ID = '([A-Za-z0-9]{6,32})';
@@ -34,6 +41,7 @@ const STALE_CHUNK_MS = 2 * 60e3;
 
 export default {
   async fetch(request, env, ctx) {
+    hsts = env.HSTS !== '0';
     try {
       return await route(request, env, ctx);
     } catch (err) {
@@ -42,9 +50,10 @@ export default {
       return json({ error: 'Something went wrong' }, 500);
     }
   },
-  // Hourly (wrangler.toml [triggers]): delete videos past their expiry.
+  // Hourly (wrangler.toml [triggers]): delete videos past their expiry, then index a few files
+  // that have no fragment index yet (older recordings; builds cut short).
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(sweepExpired(env));
+    ctx.waitUntil(sweepExpired(env).then(() => indexBacklog(env)));
   },
 };
 
@@ -65,7 +74,7 @@ async function route(request, env, ctx) {
   if (path === '/api/me' && method === 'GET') {
     return json({ owner: await isOwner(request, env), passwordSet: !!env.OWNER_PASSWORD, partSize: PART_SIZE, transcripts: !!provider(env) });
   }
-  if (path === '/api/login' && method === 'POST') return login(request, env);
+  if (path === '/api/login' && method === 'POST') return login(request, env, url);
   if (path === '/api/logout' && method === 'POST') {
     checkSameOrigin(request, url);
     return json({ ok: true }, 200, { 'Set-Cookie': `${COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax` });
@@ -76,7 +85,7 @@ async function route(request, env, ctx) {
   if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, ctx, m[1], m[2] || 'main', url);
   if (match(new RegExp(`^/thumb/${ID}(?:/(cam|og))?(?:\\.jpg)?$`)) && method === 'GET') return thumb(request, env, m[1], m[2] || 'poster');
   if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(env, m[1]);
-  if (match(new RegExp(`^/api/videos/${ID}/view$`)) && method === 'POST') return countView(request, env, m[1]);
+  if (match(new RegExp(`^/api/videos/${ID}/view$`)) && method === 'POST') return countView(request, env, m[1], url);
   if (match(new RegExp(`^/api/videos/${ID}/transcript$`)) && method === 'GET') return getTranscript(request, env, m[1]);
 
   if (!path.startsWith('/api/')) return new Response('Not found', { status: 404 });
@@ -108,11 +117,15 @@ async function route(request, env, ctx) {
 
 // ---------- auth ----------
 
-async function login(request, env) {
+async function login(request, env, url) {
   if (!env.OWNER_PASSWORD) throw new HttpError(503, 'OWNER_PASSWORD is not set on the server');
-  const body = await readJson(request);
+  // Only this site's own page may try a password: another site posting wrong ones from his
+  // browser would otherwise lock him out (a cross-site form can't send application/json).
+  checkSameOrigin(request, url);
+  if (!/^application\/json\b/i.test(request.headers.get('Content-Type') || '')) throw new HttpError(415, 'Send JSON');
+  const body = await readJson(request, MAX_LOGIN_JSON);
   const given = String(body.password || '');
-  const ip = request.headers.get('CF-Connecting-IP') || 'local';
+  const ip = loginNet(request.headers.get('CF-Connecting-IP'));
   const now = Date.now();
   // The attempt is recorded before it is counted, in one transaction, so concurrent requests
   // each see the others and at most LOGIN_PER_IP of them get to check the password.
@@ -127,7 +140,10 @@ async function login(request, env) {
   // A flood from many addresses shrinks every address's allowance, but never blocks one that
   // hasn't been guessing: the owner's right password still gets in.
   const allowed = recent.everyone > LOGIN_GLOBAL ? LOGIN_PER_IP_FLOOD : LOGIN_PER_IP;
-  if (recent.mine > allowed) {
+  // A flood big enough to be guessing from many addresses at once: only a browser that has
+  // signed in before gets its password checked (so the owner still gets in from his own).
+  const shut = recent.everyone > LOGIN_GLOBAL_HARD && !(await signedCookie(request, env, DEVICE_COOKIE, 'device'));
+  if (recent.mine > allowed || shut) {
     // Refused attempts don't count (only checked ones do), so hammering doesn't extend the wait.
     await env.DB.prepare('DELETE FROM login_failures WHERE rowid = ?').bind(rid).run();
     throw new HttpError(429, 'Too many tries. Wait 15 minutes.');
@@ -141,18 +157,37 @@ async function login(request, env) {
   }
   await env.DB.prepare('DELETE FROM login_failures WHERE ip = ? OR rowid = ?').bind(ip, rid).run();
   const exp = Date.now() + SESSION_DAYS * 864e5;
-  const sig = await hmac(env, `owner.${exp}`);
-  const cookie = `${COOKIE}=${exp}.${sig}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`;
-  return json({ ok: true }, 200, { 'Set-Cookie': cookie });
+  const dexp = Date.now() + DEVICE_DAYS * 864e5;
+  const res = json({ ok: true });
+  res.headers.append('Set-Cookie', `${COOKIE}=${exp}.${await hmac(env, `owner.${exp}`)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`);
+  res.headers.append('Set-Cookie', `${DEVICE_COOKIE}=${dexp}.${await hmac(env, `device.${dexp}`)}; Path=/; Max-Age=${DEVICE_DAYS * 86400}; HttpOnly; Secure; SameSite=Lax`);
+  return res;
+}
+
+// What a login attempt is counted against: an IPv4 address, or an IPv6 /64 (one machine can
+// hold a whole /64, so counting single IPv6 addresses would allow unlimited tries).
+export function loginNet(ip) {
+  if (!ip) return 'local';
+  if (!ip.includes(':') || ip.includes('.')) return ip; // IPv4 (or IPv4-mapped)
+  const [head, tail] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail ? tail.split(':') : [];
+  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).map((g) => (parseInt(g, 16) || 0).toString(16)).join(':')}::/64`;
 }
 
 async function isOwner(request, env) {
+  return signedCookie(request, env, COOKIE, 'owner');
+}
+
+// A cookie of ours holding `${exp}.${hmac(kind + '.' + exp)}`, still in date.
+async function signedCookie(request, env, name, kind) {
   if (!env.OWNER_PASSWORD) return false;
-  const raw = (request.headers.get('Cookie') || '').split(/;\s*/).find((c) => c.startsWith(COOKIE + '='));
+  const raw = (request.headers.get('Cookie') || '').split(/;\s*/).find((c) => c.startsWith(name + '='));
   if (!raw) return false;
-  const [exp, sig] = raw.slice(COOKIE.length + 1).split('.');
+  const [exp, sig] = raw.slice(name.length + 1).split('.');
   if (!exp || !sig || Number(exp) < Date.now()) return false;
-  return safeEqual(sig, await hmac(env, `owner.${exp}`));
+  return safeEqual(sig, await hmac(env, `${kind}.${exp}`));
 }
 
 async function hmac(env, msg) {
@@ -213,13 +248,10 @@ async function uploadPart(request, env, id, n, track) {
   const v = await getVideo(env, id);
   const uploadId = track === 'cam' ? v.cam_upload_id : v.upload_id;
   if (v.status !== 'recording' || !uploadId) throw new HttpError(409, 'This recording is already finished');
-  const len = Number(request.headers.get('Content-Length') || 0);
   if (!request.body) throw new HttpError(400, 'Empty part');
-  if (len && len > PART_SIZE) throw new HttpError(400, 'Part too large');
-  // R2 needs a known length; buffer the (≤5 MiB) part.
-  const bytes = await request.arrayBuffer();
+  // R2 needs a known length; buffer the (≤5 MiB) part, and not a byte more.
+  const bytes = await readBody(request, PART_SIZE, 'Part too large');
   if (bytes.byteLength === 0) throw new HttpError(400, 'Empty part');
-  if (bytes.byteLength > PART_SIZE) throw new HttpError(400, 'Part too large');
   const part = await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId).uploadPart(n, bytes);
   await env.DB.batch([
     env.DB.prepare('INSERT OR REPLACE INTO parts (video_id, track, n, etag, size) VALUES (?, ?, ?, ?, ?)').bind(id, track, n, part.etag, bytes.byteLength),
@@ -288,8 +320,8 @@ async function completeVideo(request, env, ctx, id, url) {
 async function putThumb(request, env, id, variant) {
   if (!THUMBS.includes(variant)) throw new HttpError(400, 'Bad thumbnail variant');
   await getVideo(env, id);
-  const bytes = await request.arrayBuffer();
-  if (!bytes.byteLength || bytes.byteLength > 2 * 1024 * 1024) throw new HttpError(400, 'Bad thumbnail');
+  const bytes = await readBody(request, MAX_THUMB, 'Bad thumbnail');
+  if (!bytes.byteLength) throw new HttpError(400, 'Bad thumbnail');
   await env.VIDEOS.put(thumbKey(id, variant), bytes, { httpMetadata: { contentType: 'image/jpeg' } });
   const col = { poster: 'has_thumb', cam: 'has_cam_thumb', og: 'has_og' }[variant];
   await env.DB.prepare(`UPDATE videos SET ${col} = 1, updated_at = ? WHERE id = ?`).bind(Date.now(), id).run();
@@ -353,10 +385,16 @@ async function removeVideo(env, v) {
       try { await env.VIDEOS.resumeMultipartUpload(videoKey(id, track), uploadId).abort(); } catch {}
     }
   }
-  const audio = await env.VIDEOS.list({ prefix: `audio/${id}/` });
-  await env.VIDEOS.delete([
-    videoKey(id, 'main'), videoKey(id, 'cam'), ...THUMBS.map((t) => thumbKey(id, t)), ...audio.objects.map((o) => o.key),
-  ]);
+  // Every audio chunk (a long recording can have more than one listing page), deleted in
+  // batches of at most 1,000 keys, which is what R2 takes.
+  const keys = [videoKey(id, 'main'), videoKey(id, 'cam'), ...THUMBS.map((t) => thumbKey(id, t))];
+  let cursor;
+  do {
+    const page = await env.VIDEOS.list({ prefix: `audio/${id}/`, cursor });
+    keys.push(...page.objects.map((o) => o.key));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  for (let i = 0; i < keys.length; i += 1000) await env.VIDEOS.delete(keys.slice(i, i + 1000));
   await env.DB.batch([
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
     env.DB.prepare('DELETE FROM transcript_chunks WHERE video_id = ?').bind(id),
@@ -375,9 +413,11 @@ async function status(env, id) {
   return json({ status: v.status });
 }
 
-async function countView(request, env, id) {
+async function countView(request, env, id, url) {
+  checkSameOrigin(request, url); // the share page counts a view; another site can't
   if (await isOwner(request, env)) return json({ ok: true, counted: false });
-  await env.DB.prepare("UPDATE videos SET views = views + 1 WHERE id = ? AND status = 'ready'").bind(id).run();
+  await env.DB.prepare("UPDATE videos SET views = views + 1 WHERE id = ? AND status = 'ready' AND (expires_at IS NULL OR expires_at > ?)")
+    .bind(id, Date.now()).run();
   return json({ ok: true, counted: true });
 }
 
@@ -390,8 +430,8 @@ async function putAudio(request, env, ctx, id, seq) {
   const startMs = clampInt(request.headers.get('X-Start-Ms'), 0, 1e9);
   const durationMs = clampInt(request.headers.get('X-Duration-Ms'), 0, 1e7);
   const silent = request.headers.get('X-Silent') === '1';
-  const bytes = await request.arrayBuffer();
-  if (!silent && (bytes.byteLength < 44 || bytes.byteLength > MAX_AUDIO_CHUNK)) throw new HttpError(400, 'Bad audio chunk');
+  const bytes = await readBody(request, MAX_AUDIO_CHUNK, 'Bad audio chunk');
+  if (!silent && bytes.byteLength < 44) throw new HttpError(400, 'Bad audio chunk');
   const now = Date.now();
   const p = provider(env);
   // Silence skips the model (Whisper invents words on silence), and so does having no provider.
@@ -537,19 +577,20 @@ async function rawVideo(request, env, ctx, id, track, url) {
   const head = await env.VIDEOS.head(key);
   if (!head) return new Response('Not found', { status: 404 });
   const mime = (track === 'cam' ? v.cam_mime : v.mime) || head.httpMetadata?.contentType || 'video/mp4';
-  // The fragment index (see mp4index.js), spliced in at `at`. Built once per file; a file
-  // that hasn't been indexed yet is served as stored and indexed in the background.
+  // The fragment index (see mp4index.js), spliced in at `at`. Built when the recording completes;
+  // a file without one (an older recording) is served as stored until the hourly job indexes it.
+  // Never built here: a viewer's request must not set off work.
   const idx = (parseJson(v.mp4_index, {}) || {})[track];
   const fresh = idx && idx.etag === head.etag;
-  if (!fresh && /mp4/.test(mime)) ctx.waitUntil(indexTrack(env, id, track));
   const sidx = fresh && idx.sidx ? b64decode(idx.sidx) : null;
   const at = sidx ? idx.at : 0;
   const insert = sidx ? sidx.length : 0;
   const size = head.size + insert;
+  const etag = sidx ? `"${head.etag}-x"` : head.httpEtag;
   const headers = new Headers({
     'Content-Type': mime,
     'Accept-Ranges': 'bytes',
-    'ETag': sidx ? `"${head.etag}-x"` : head.httpEtag,
+    'ETag': etag,
     // The camera can be hidden from viewers at any time (and the owner still gets it then), so
     // no cache may keep it or serve it without asking again.
     'Cache-Control': download ? 'private, no-store' : track === 'cam' ? 'private, no-cache' : 'public, max-age=300',
@@ -560,7 +601,10 @@ async function rawVideo(request, env, ctx, id, track, url) {
     const name = (v.title || 'video').replace(/[^\w\- .]+/g, '').trim().slice(0, 80) || 'video';
     headers.set('Content-Disposition', `attachment; filename="${name}${track === 'cam' ? ' (camera)' : ''}.${ext}"`);
   }
-  const range = parseRange(request.headers.get('Range'), size);
+  // A resumed download names the file it started (If-Range). If that isn't this one (the index
+  // arrived in between and shifted every offset), it gets the whole file, not a mismatched piece.
+  const ifRange = request.headers.get('If-Range');
+  const range = ifRange && ifRange !== etag ? null : parseRange(request.headers.get('Range'), size);
   if (range === 'invalid') {
     headers.set('Content-Range', `bytes */${size}`);
     return new Response(null, { status: 416, headers });
@@ -619,6 +663,15 @@ async function indexTrack(env, id, track) {
     const key = videoKey(id, track);
     const head = await env.VIDEOS.head(key);
     if (!head) return;
+    // Recorded before the build starts: a build the runtime kills (CPU, memory) leaves this
+    // behind, and after INDEX_TRIES of them the file is left as it is.
+    const row = await env.DB.prepare('SELECT mp4_index FROM videos WHERE id = ?').bind(id).first();
+    const prev = row && (parseJson(row.mp4_index, {}) || {})[track];
+    const same = prev && prev.etag === head.etag;
+    if (same && (prev.sidx || prev.none)) return;
+    if (same && prev.pending && (prev.tries >= INDEX_TRIES || Date.now() - prev.at < 10 * 60e3)) return;
+    const tries = same && prev.pending ? prev.tries + 1 : 1;
+    await storeIndex(env, id, track, { pending: true, etag: head.etag, tries, at: Date.now() });
     const read = async (offset, length) => {
       const obj = await env.VIDEOS.get(key, { range: { offset, length } });
       if (!obj) throw new Error('range read failed');
@@ -632,8 +685,7 @@ async function indexTrack(env, id, track) {
       console.error(`index ${k}:`, e && e.message);
       entry = { none: true, etag: head.etag, error: String(e && e.message || e).slice(0, 200) };
     }
-    await env.DB.prepare(`UPDATE videos SET mp4_index = json_set(COALESCE(mp4_index, '{}'), '$.' || ?, json(?)) WHERE id = ?`)
-      .bind(track, JSON.stringify(entry), id).run();
+    await storeIndex(env, id, track, entry);
   } catch (e) {
     console.error(`index ${k}:`, e && e.message);
   } finally {
@@ -641,12 +693,37 @@ async function indexTrack(env, id, track) {
   }
 }
 
+function storeIndex(env, id, track, entry) {
+  return env.DB.prepare(`UPDATE videos SET mp4_index = json_set(COALESCE(mp4_index, '{}'), '$.' || ?, json(?)) WHERE id = ?`)
+    .bind(track, JSON.stringify(entry), id).run();
+}
+
+// A few MP4 tracks a run that have no index yet (recorded before indexing existed, or a build
+// that didn't finish), newest first.
+async function indexBacklog(env, max = 3) {
+  try {
+    const { results } = await env.DB.prepare(
+      "SELECT id, mime, cam_mime, mp4_index FROM videos WHERE status = 'ready' AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC LIMIT 500"
+    ).bind(Date.now()).all();
+    let n = 0;
+    for (const v of results) {
+      const idx = parseJson(v.mp4_index, {}) || {};
+      for (const [track, mime] of [['main', v.mime], ['cam', v.cam_mime]]) {
+        const e = idx[track];
+        if (!mime || !/mp4/i.test(mime) || (e && (e.sidx || e.none || (e.pending && e.tries >= INDEX_TRIES)))) continue;
+        await indexTrack(env, v.id, track);
+        if (++n >= max) return;
+      }
+    }
+  } catch (e) { console.error('index backlog', e && e.message); }
+}
+
 function b64encode(bytes) { let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return btoa(s); }
 function b64decode(str) { const s = atob(str); const out = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i); return out; }
 
 async function thumb(request, env, id, variant) {
   const v = await env.DB.prepare('SELECT layout, expires_at FROM videos WHERE id = ?').bind(id).first();
-  if (expired(v)) return new Response('Not found', { status: 404 });
+  if (!v || expired(v)) return new Response('Not found', { status: 404 });
   if (variant !== 'poster') {
     if (v && camHidden(v)) {
       if (variant === 'cam' && !(await isOwner(request, env))) return new Response('Not found', { status: 404 });
@@ -659,7 +736,8 @@ async function thumb(request, env, id, variant) {
     return new Response(PLACEHOLDER_SVG, { headers: { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' } });
   }
   // The camera thumbnail is his face and can be hidden later: same rule as the camera track.
-  return new Response(obj.body, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': variant === 'cam' ? 'private, no-cache' : 'public, max-age=3600' } });
+  // Five minutes, like the video: a deleted video, or a camera he hides, stops showing soon.
+  return new Response(obj.body, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': variant === 'cam' ? 'private, no-cache' : 'public, max-age=300' } });
 }
 
 // ---------- helpers ----------
@@ -779,8 +857,30 @@ function parseJson(s, fallback) {
   try { return s ? JSON.parse(s) : fallback; } catch { return fallback; }
 }
 
-async function readJson(request) {
-  try { return await request.json(); } catch { throw new HttpError(400, 'Bad JSON'); }
+async function readJson(request, max = MAX_JSON) {
+  const text = new TextDecoder().decode(await readBody(request, max, 'Request too large'));
+  try { return JSON.parse(text); } catch { throw new HttpError(400, 'Bad JSON'); }
+}
+
+// A request body, refused (413) as soon as it passes `max` bytes: never buffers more than that.
+async function readBody(request, max, message = 'Too large') {
+  const declared = request.headers.get('Content-Length');
+  if (declared !== null && Number(declared) > max) throw new HttpError(413, message);
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let n = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    n += value.byteLength;
+    if (n > max) { reader.cancel().catch(() => {}); throw new HttpError(413, message); }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (const c of chunks) { out.set(c, o); o += c.byteLength; }
+  return out;
 }
 
 function b64url(bytes) {
@@ -793,8 +893,14 @@ function b64url(bytes) {
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.bunny.net; font-src https://fonts.bunny.net; "
   + "media-src 'self' blob:; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
+// HTTPS only, remembered for a year. Not from local runs (HSTS = "0"): the preview shares a host
+// name with other services there. Sent by the Worker's own responses (every page load calls
+// /api/me); public/_headers can't be switched per environment, so it doesn't send it.
+let hsts = false;
+
 function securityHeaders() {
   return {
+    ...(hsts ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}),
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
     'Content-Security-Policy': CSP,

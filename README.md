@@ -29,6 +29,8 @@ Record your screen and camera, get a link. Styled after christophermoravec.com (
 
 Links are public by unguessable id (12 characters, about 70 bits). Everything else needs the owner password.
 
+**Signing in.** Only Shuttle's own page can try a password (another site posting wrong ones from your browser can't lock you out). Each address gets 10 tries per 15 minutes; an IPv6 address counts as its whole /64. While more than 100 tries an hour fail, each address gets 3. Past 300 an hour, only a browser that has signed in before gets to try, so yours still works and a guesser's doesn't. Use a long random `OWNER_PASSWORD` all the same. Changing it signs every browser out.
+
 **What "cut" means:** edits are skipped during playback. They are not removed from the file. The full recording stays reachable at `/raw/<id>` (it has to be public to stream), and the cut ranges are in the page. Don't rely on a cut to hide something sensitive; re-record instead.
 
 ## Deploy
@@ -64,7 +66,8 @@ npm run dev                                       # migrations + wrangler dev --
 - `npm test` runs:
   - the timeline maths (17 checks);
   - the transcript post-processing (17);
-  - the API contract (41), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+  - the fragment index on hostile files (10): oversized counts, boxes and fragments, truncation, 3,000 random mutations;
+  - the API contract (46), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
 - `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
   - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
   - `SURFACE=window` (a window share keeps the bubble)
