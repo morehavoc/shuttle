@@ -68,7 +68,7 @@ npm run dev                                       # migrations + wrangler dev --
   - the timeline maths (19 checks);
   - the transcript post-processing (17);
   - the API contract (44), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
-- `node test/e2e-mobile.mjs` is the iPhone run (WebKit, iPhone 15 emulation, no screen capture): the camera-only setup, the labelled recording bar, recording again without a refresh (after Library, after deleting one), and a page coming back from Safari's back/forward cache. Same `BASE`/server as below.
+- `node test/e2e-mobile.mjs` is the phone run (WebKit, iPhone 15 emulation). An iOS 27 iPhone can record the screen: it records Screen + cam, Screen and Camera with the labelled phone recording bar (one row from 320 to 430 px wide), records again without a refresh (after deleting one, via Library, after Safari's back/forward cache brings the page back), never reloads under a recording that is starting or under way, and saves a recording whose recorder fails while paused. An older iPhone without screen capture gets a camera-only setup that says why, and a laptop keeps the compact bar. Same `BASE`/server as below.
 - `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, trimming, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
   - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
   - `SURFACE=window` (a window share keeps the bubble)

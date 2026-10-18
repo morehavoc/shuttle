@@ -14,11 +14,10 @@ boot();
 
 // Safari keeps this page in its back/forward cache. Coming back to it after a recording
 // (Back from the share page) restores it exactly as it was left: under the "Finishing upload"
-// screen, with the finished session still current. Start it fresh instead.
-window.addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });
-
-// No screen capture (a phone): camera only, so the setup and recording controls are simpler.
-if (!canRecordScreen()) document.documentElement.classList.add('camera-only');
+// screen, with the finished session still current. Start it fresh instead, but not while a
+// recording is starting or under way: a phone recording its screen leaves Safari for other
+// apps, and a mobile browser may fire this when it brings a frozen page back.
+window.addEventListener('pageshow', (e) => { if (e.persisted && !setup.busy && !holdsRecording()) location.reload(); });
 
 async function boot() {
   let me;
@@ -183,7 +182,7 @@ function openSetup() {
         h('div', { class: 'meter', 'aria-hidden': 'true', style: 'grid-column:auto' }, h('i', { id: 'meter' })),
       ),
       h('div', { class: 'sheet-foot' },
-        h('span', { class: 'note', id: 'setup-note' }),
+        h('span', { class: 'note', id: 'setup-note' }, screenOk ? '' : 'This browser can’t record the screen.'),
         startBtn,
       ),
     ),
@@ -423,8 +422,13 @@ async function run(session, bubble, displayP, bubbleP) {
 // surface) would.
 function keepsBubble(surface) { return surface === 'window' || surface === 'browser'; }
 
+// A recording that leaving or reloading this page would lose.
+function holdsRecording() {
+  return !!current && !current.left && ['ready', 'recording', 'paused', 'stopping', 'failed'].includes(current.session.state);
+}
+
 function guardUnload(e) {
-  if (current && ['ready', 'recording', 'paused', 'stopping', 'failed'].includes(current.session.state)) {
+  if (holdsRecording()) {
     e.preventDefault();
     e.returnValue = '';
   }
@@ -470,7 +474,7 @@ function buildStage(session) {
   const pauseBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Pause', 'aria-label': 'Pause', html: `${icon.pause}<b>Pause</b>`, onclick: () => {
     if (session.state === 'recording') session.pause(); else if (session.state === 'paused') session.resume();
   } });
-  const bubbleBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Float camera', 'aria-label': 'Float camera', html: icon.bubble, hidden: true, onclick: async () => {
+  const bubbleBtn = h('button', { class: 'icon-btn', type: 'button', title: 'Float camera', 'aria-label': 'Float camera', html: `${icon.bubble}<b>Bubble</b>`, hidden: true, onclick: async () => {
     if (current && current.bubble && (await current.bubble.open(setupCam()))) syncBubbleButton();
   } });
   const bar = h('div', { class: 'recbar', role: 'toolbar', 'aria-label': 'Recording' },
@@ -498,7 +502,7 @@ function buildStage(session) {
     if (current && current.bubble) current.bubble.setPaused(paused);
     if (!['recording', 'paused'].includes(session.state)) { clearInterval(interval); clearInterval(heartbeat); }
     // MediaRecorder died mid-recording: save what we have.
-    if (session.state === 'failed' && session.failedWhile === 'recording' && !ui.finishing) salvage();
+    if (session.state === 'failed' && ['recording', 'paused'].includes(session.failedWhile) && !ui.finishing) salvage();
   });
   session.addEventListener('display-ended', () => {
     if (session.state === 'recording' || session.state === 'paused') finish(document);
@@ -690,6 +694,7 @@ async function salvage() {
 
 function leave(session, copied) {
   window.removeEventListener('beforeunload', guardUnload);
+  if (current && current.session === session) current.left = true; // uploaded: nothing here to lose
   if (current && current.bubble) setTimeout(() => current && current.bubble && current.bubble.close(), 4000);
   closeSetup();
   location.href = `/v/${session.video.id}?new=1${copied ? '&copied=1' : ''}`;
