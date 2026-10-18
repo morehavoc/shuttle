@@ -200,6 +200,7 @@ a { color: inherit; }
 .recbar .stop:hover { background: #f25c5c; }
 .recbar .stop svg { width: 14px; height: 14px; }
 .recbar .up { font-size: 12px; color: #b3aea4; }
+.recbar .icon-btn b { display: none; }
 .stage { position: fixed; inset: 0; z-index: 55; background: #0e0e10; display: grid; place-items: center; }
 .stage > video { width: 100%; height: 100%; object-fit: contain; }
 .stage video.mirror { transform: scaleX(-1); }
@@ -217,6 +218,8 @@ a { color: inherit; }
   backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
 }
 .countdown span { font-size: 140px; font-weight: 800; color: #fff; text-shadow: 0 10px 40px rgba(0, 0, 0, .5); animation: tick 1s ease forwards; }
+.countdown small { display: none; position: absolute; left: 0; right: 0; bottom: calc(40px + env(safe-area-inset-bottom)); text-align: center; font-size: 15px; color: rgba(255, 255, 255, .8); }
+@media (hover: none) and (pointer: coarse) { .countdown small { display: block; } } /* a phone: no hover tooltip */
 .finishing { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: var(--bg); }
 .finishing .box { text-align: center; display: grid; gap: 14px; justify-items: center; }
 .progress { width: 260px; height: 6px; border-radius: 6px; background: var(--line); overflow: hidden; }
@@ -422,6 +425,7 @@ a { color: inherit; }
 @keyframes fade { from { opacity: 0; } }
 @keyframes pop { from { opacity: 0; transform: scale(.96) translateY(6px); } }
 @keyframes rise { from { opacity: 0; transform: translate(-50%, 16px); } }
+@keyframes rise-phone { from { opacity: 0; transform: translateY(16px); } }
 @keyframes tick { 0% { transform: scale(1.4); opacity: 0; } 25% { transform: scale(1); opacity: 1; } 85% { opacity: 1; } 100% { opacity: 0; transform: scale(.85); } }
 
 @media (max-width: 600px) {
@@ -435,6 +439,28 @@ a { color: inherit; }
   .sp-speed { padding: 0 4px; }
   .sp.started.controls-on .sp-cam-wrap.bottom { transform: translateY(-40px); }
   .sp.started.controls-on .sp-caption { bottom: 54px; }
+}
+/* A phone (touch, no hover), in every mode — iPhone Safari records the screen too since iOS 27:
+   one row of big labelled buttons, Delete apart from Stop, upload status in a pill above the bar.
+   After the narrow-screen rules, which would otherwise move it off the home indicator. */
+@media (hover: none) and (pointer: coarse) {
+  .recbar {
+    left: 10px; right: 10px; max-width: 520px; margin: 0 auto; transform: none; bottom: calc(10px + env(safe-area-inset-bottom));
+    padding: 10px 10px 10px 12px; gap: 4px; border-radius: 20px; animation-name: rise-phone;
+  }
+  .recbar .time { order: -1; font-size: 17px; margin-right: auto; }
+  .recbar .up {
+    position: absolute; left: 50%; bottom: calc(100% + 8px); transform: translateX(-50%); white-space: nowrap;
+    background: #17171a; border-radius: 10px; padding: 5px 12px; font-size: 13px;
+  }
+  .recbar .up:empty { display: none; }
+  .recbar .icon-btn { width: auto; height: 54px; min-width: 56px; padding: 0 6px; display: inline-grid; grid-template-rows: auto auto; gap: 3px; align-content: center; justify-items: center; }
+  .recbar .icon-btn svg { width: 22px; height: 22px; }
+  .recbar .icon-btn b { display: block; font-size: 11.5px; font-weight: 600; }
+  .recbar .rec-delete { order: -3; color: #ff8a80; margin-right: 4px; }
+  .recbar .dot { order: -2; }
+  .recbar .stop { height: 54px; padding: 0 16px; font-size: 17px; border-radius: 14px; }
+  .recbar .stop svg { width: 16px; height: 16px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
