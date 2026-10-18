@@ -2,6 +2,7 @@ import { $, h, icon, toast, api, fmtDuration, copyText } from './ui.js';
 import { Player } from './player.js';
 import {
   normalizeCuts, addCut, removeCut, wordRange, isWordCut, fillerCuts, pauseCuts, paragraphs, editedDuration, toEdited,
+  trimCuts, withTrim,
 } from './timeline.js';
 
 const { video: v, owner, ownerName } = JSON.parse(document.getElementById('shuttle-data').textContent);
@@ -12,13 +13,20 @@ if (params.has('new')) history.replaceState(null, '', `/v/${v.id}`);
 let player = null;
 let words = [];
 let cuts = normalizeCuts(v.cuts || []);
+let trim = cleanTrim(v.trim); // { start, end }: where it starts and stops (end null: the end)
 const duration = () => (player && player.duration) || (v.durationMs || 0) / 1000;
+// What playback skips: the cuts and the trim. They are kept apart so neither edit swallows the other.
+const playCuts = () => withTrim(cuts, trim, duration() || Infinity);
+const hasTrim = () => trim.start > 0 || trim.end !== null;
+function cleanTrim(t) {
+  return { start: t && t.start > 0 ? t.start : 0, end: t && typeof t.end === 'number' ? t.end : null };
+}
 
 // ---------- byline ----------
 function renderWhen() {
   const date = new Date(v.createdAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
   const d = duration();
-  const len = d ? fmtDuration(editedDuration(cuts, d) * 1000) : '';
+  const len = d ? fmtDuration(editedDuration(playCuts(), d) * 1000) : '';
   $('#when').textContent = [date, len].filter(Boolean).join(' · ');
 }
 renderWhen();
@@ -143,7 +151,7 @@ async function exportTogether() {
   document.body.append(box);
   player.pause();
   try {
-    const blob = await exportComposite({ ...v, cuts }, {
+    const blob = await exportComposite({ ...v, cuts: playCuts() }, {
       layout: player.layout, ownerName, signal: ctrl.signal,
       onProgress: (p) => { const pc = Math.round(p * 100); label.textContent = `Making your video… ${pc}%`; bar.firstChild.style.width = `${pc}%`; },
     });
@@ -211,8 +219,9 @@ function ownerPanel() {
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
 }
 
-// Trim: two handles that cut the start and the end. They are ordinary cuts (from 0, and to
-// the end), so Undo, the transcript, viewers and the "with your edits" download follow them.
+// Trim: two handles for where the video starts and stops. Stored apart from the cuts, so a trim
+// never swallows a cut it passes over; Undo, the transcript, viewers and the "with your edits"
+// download follow it.
 let onCutsChanged = null;
 function trimRow() {
   const MIN = 1; // seconds that must stay between the handles
@@ -221,13 +230,7 @@ function trimRow() {
   const hi = h('input', { type: 'range', class: 'trim-hi', min: '0', step: '0.05', value: '0', 'aria-label': 'Trim end' });
   const fill = h('div', { class: 'trim-fill' });
   const label = h('span', { class: 'row-note trim-label' });
-  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => commit(0, duration()) }, 'Reset');
-  const current = () => {
-    const d = duration();
-    let s = 0, e = d;
-    for (const c of cuts) { if (c[0] <= 0.01) s = Math.max(s, c[1]); if (c[1] >= d - 0.01) e = Math.min(e, c[0]); }
-    return [s, e];
-  };
+  const reset = h('button', { type: 'button', class: 'btn btn-sm btn-ghost', onclick: () => setTrim({ start: 0, end: null }) }, 'Reset');
   const paint = (s, e) => {
     const d = duration() || 1;
     fill.style.left = `${(s / d) * 100}%`;
@@ -240,7 +243,7 @@ function trimRow() {
   const sync = () => {
     const d = duration();
     lo.max = hi.max = String(d);
-    const [s, e] = current();
+    const s = Math.min(trim.start, d), e = trim.end === null ? d : Math.min(trim.end, d);
     lo.value = String(s);
     hi.value = String(e);
     paint(s, e);
@@ -257,18 +260,23 @@ function trimRow() {
     paint(s, e);
     player.previewAt(e);
   });
-  lo.addEventListener('change', () => commit(Number(lo.value), Number(hi.value)));
-  hi.addEventListener('change', () => commit(Number(lo.value), Number(hi.value)));
-  function commit(s, e) {
-    const d = duration();
-    let next = cuts.filter((c) => c[0] > 0.01 && c[1] < d - 0.01);
-    if (s > EDGE) next = addCut(next, [0, s], d);
-    if (e < d - EDGE) next = addCut(next, [e, d], d);
-    next = normalizeCuts(next, d);
-    // A handle let go inside the edge cuts nothing yet; leave it where it is (re-reading the
-    // cuts would put it back at the end, so arrow keys could never step out of the edge).
-    if (JSON.stringify(next) === JSON.stringify(normalizeCuts(cuts, d))) return;
-    apply(next, s <= EDGE && e >= d - EDGE ? 'Trim removed' : 'Trimmed');
+  // Saved when let go, or once the arrow keys pause: one Undo step and one toast per adjustment.
+  // Only the handle that moved changes.
+  const timers = {};
+  const later = (k, fn) => { clearTimeout(timers[k]); timers[k] = setTimeout(fn, 300); };
+  lo.addEventListener('change', () => later('lo', () => {
+    const s = Number(lo.value);
+    setTrim({ ...trim, start: s <= EDGE ? 0 : s });
+  }));
+  hi.addEventListener('change', () => later('hi', () => {
+    const e = Number(hi.value);
+    setTrim({ ...trim, end: e >= duration() - EDGE ? null : e });
+  }));
+  function setTrim(next) {
+    // Inside the edge nothing is trimmed yet; the handle stays where it was let go (re-reading
+    // the trim would put it back at the end, and arrow keys could never step out of the edge).
+    if (next.start === trim.start && next.end === trim.end) return;
+    apply(cuts, next.start > 0 || next.end !== null ? 'Trimmed' : 'Trim removed', { trim: next });
   }
   onCutsChanged = sync;
   for (const ev of ['loadedmetadata', 'durationchange']) player.main.addEventListener(ev, sync); // the real length may arrive later
@@ -378,16 +386,18 @@ function renderWords() {
   const body = $('#tc-body');
   if (!body) return;
   wordEls = [];
-  const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], cuts));
+  const play = playCuts(), trimmed = trimCuts(trim);
+  const visible = owner ? words.map((w, i) => i) : words.map((w, i) => i).filter((i) => !isWordCut(words[i], play));
   const paras = paragraphs(visible.map((i) => words[i]));
   body.replaceChildren(...paras.map((idxs) => {
     const first = words[visible[idxs[0]]];
-    const p = h('p', { class: 'tc-p' }, h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, cuts)) * 1000)));
+    const p = h('p', { class: 'tc-p' }, h('button', { class: 'tc-ts', type: 'button', onclick: () => player.seekSource(first.s) }, fmtDuration(Math.max(0, toEdited(first.s, play)) * 1000)));
     for (const k of idxs) {
       const i = visible[k];
       const w = words[i];
       const span = h('span', { class: 'w', 'data-i': String(i) }, w.w);
       if (isWordCut(w, cuts)) span.classList.add('cut');
+      else if (isWordCut(w, trimmed)) span.classList.add('trimmed');
       wordEls[i] = span;
       p.append(span, ' ');
     }
@@ -434,9 +444,9 @@ function renderEditTools(tools) {
   const editBtn = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => setEditing(!editing) }, 'Edit');
   const extra = h('div', { class: 'tc-edit-tools', hidden: true },
     h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(fillerCuts(words, duration())), 'Filler words removed') }, 'Remove ums'),
-    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(pauseCuts(words, cuts, duration())), 'Pauses shortened') }, 'Shorten pauses'),
+    h('button', { class: 'btn btn-sm', type: 'button', onclick: () => apply(addAll(pauseCuts(words, playCuts(), duration())), 'Pauses shortened') }, 'Shorten pauses'),
     h('button', { class: 'btn btn-sm', type: 'button', id: 'undo', onclick: undo, disabled: true }, 'Undo'),
-    h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], 'All edits removed') }, 'Restore all'),
+    h('button', { class: 'btn btn-sm btn-ghost', type: 'button', onclick: () => apply([], hasTrim() ? 'All cuts restored (the trim stays)' : 'All edits removed') }, 'Restore all'),
   );
   tools.append(extra, editBtn);
   function setEditing(on) {
@@ -455,14 +465,21 @@ function addAll(ranges) {
   return c;
 }
 
-function apply(next, message, { record = true } = {}) {
+function apply(next, message, { record = true, trim: nextTrim = trim } = {}) {
   if (record) {
-    undoStack.push(cuts);
+    undoStack.push({ cuts, trim });
     if (undoStack.length > 100) undoStack.shift();
   }
   cuts = normalizeCuts(next, duration());
-  player.setCuts(cuts);
-  for (let i = 0; i < words.length; i++) if (wordEls[i]) wordEls[i].classList.toggle('cut', isWordCut(words[i], cuts));
+  trim = nextTrim;
+  player.setCuts(playCuts());
+  const trimmed = trimCuts(trim);
+  for (let i = 0; i < words.length; i++) {
+    if (!wordEls[i]) continue;
+    const cut = isWordCut(words[i], cuts);
+    wordEls[i].classList.toggle('cut', cut);
+    wordEls[i].classList.toggle('trimmed', !cut && isWordCut(words[i], trimmed));
+  }
   const undoBtn = $('#undo');
   if (undoBtn) undoBtn.disabled = !undoStack.length;
   renderWhen();
@@ -474,11 +491,16 @@ function apply(next, message, { record = true } = {}) {
 
 function undo() {
   if (!undoStack.length) return;
-  apply(undoStack.pop(), 'Undone', { record: false });
+  const prev = undoStack.pop();
+  apply(prev.cuts, 'Undone', { record: false, trim: prev.trim });
 }
 
+let savedTrim = JSON.stringify(trim);
 async function save() {
-  try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts } }); }
+  const body = { cuts };
+  const t = JSON.stringify(trim);
+  if (t !== savedTrim) body.trim = hasTrim() ? trim : null;
+  try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body }); savedTrim = t; }
   catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
 }
 
@@ -524,7 +546,8 @@ function showSelTools() {
   const r = selectedRange();
   if (!r) return;
   const [i, j] = r;
-  const anyKept = words.slice(i, j + 1).some((w) => !isWordCut(w, cuts));
+  const play = playCuts();
+  const anyKept = words.slice(i, j + 1).some((w) => !isWordCut(w, play));
   const anyCut = words.slice(i, j + 1).some((w) => isWordCut(w, cuts));
   const rect = window.getSelection().getRangeAt(0).getBoundingClientRect();
   selTools = h('div', { class: 'sel-tools' },
@@ -574,7 +597,7 @@ document.addEventListener('keydown', (e) => {
 // ---------- player (started last, once everything above is defined) ----------
 function init() {
 if (v.status === 'ready') {
-  player = new Player($('#player-host'), { video: v, ownerName, owner });
+  player = new Player($('#player-host'), { video: { ...v, cuts: withTrim(cuts, trim) }, ownerName, owner });
   let counted = owner;
   player.addEventListener('play', () => {
     if (counted) return;

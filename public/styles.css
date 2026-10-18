@@ -256,6 +256,9 @@ a { color: inherit; }
   pointer-events: none; -webkit-appearance: none; appearance: none; z-index: 1;
 }
 .trim input.on-top { z-index: 2; }
+.trim input[type="range"]:focus { outline: none; }
+.trim input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--accent-line); }
+.trim input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 3px var(--accent-line); }
 .trim input[type="range"]::-webkit-slider-runnable-track { height: 30px; background: transparent; }
 .trim input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none; pointer-events: auto; width: 14px; height: 26px; margin-top: 2px; border-radius: 5px;
@@ -297,6 +300,7 @@ a { color: inherit; }
 .w:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .w.now { background: color-mix(in srgb, var(--accent) 28%, transparent); }
 .w.cut { text-decoration: line-through; text-decoration-thickness: 2px; color: var(--muted); opacity: .6; }
+.w.trimmed { color: var(--muted); opacity: .45; }
 .tc-body.editing { cursor: text; }
 .tc-body.editing .w { cursor: text; }
 .tc-body.editing ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }

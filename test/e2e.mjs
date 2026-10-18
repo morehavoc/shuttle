@@ -547,6 +547,54 @@ try {
   await page.evaluate(() => document.querySelector('.sp-main').pause());
   } // !SPEECH
 
+  // ---------- trim the start and the end ----------
+  // Before the export, so the "with your edits" download is checked against the trim too.
+  const videoNow = async () => (await page.request.get(`${BASE}/api/videos/${meta.id}`)).json();
+  const total = () => page.evaluate(() => { const [m, s] = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number); return m * 60 + s; });
+  let trimStart = 0;
+  {
+    const cutsBefore = JSON.stringify((await videoNow()).cuts);
+    await page.locator('.trim-row').scrollIntoViewIfNeeded();
+    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
+    const box = await page.locator('.trim').boundingBox();
+    // Drag the start handle a quarter of the way in with the mouse; the player shows that frame.
+    const y = box.y + box.height / 2, x0 = box.x + 7; // centre of the 14 px thumb at 0
+    await page.mouse.move(x0, y);
+    await page.mouse.down();
+    for (let i = 1; i <= 10; i++) await page.mouse.move(x0 + box.width * 0.25 * (i / 10), y);
+    await page.waitForTimeout(300);
+    const during = await page.evaluate(() => ({ t: document.querySelector('.sp-main').currentTime, paused: document.querySelector('.sp-main').paused, lo: Number(document.querySelector('.trim-lo').value), label: document.querySelector('.trim-label').textContent }));
+    await page.mouse.up();
+    await page.waitForTimeout(1200); // saved 0.3 s after letting go, after the 0.4 s save delay
+    trimStart = during.lo;
+    check(during.paused && Math.abs(during.t - during.lo) < 0.15 && during.lo > d * 0.15,
+      `dragging the start handle previews that frame (${during.lo.toFixed(2)} s, "${during.label}")`, `start handle drag: ${JSON.stringify(during)} of ${d}`);
+    let saved = await videoNow();
+    check(saved.trim && Math.abs(saved.trim.start - trimStart) < 0.06 && saved.trim.end === null && JSON.stringify(saved.cuts) === cutsBefore,
+      `start trim saved (${saved.trim && saved.trim.start} s), cuts untouched`, `start trim: ${JSON.stringify(saved.trim)}, cuts ${JSON.stringify(saved.cuts)} (were ${cutsBefore})`);
+    // The end handle from the keyboard: 20 steps of 0.05 s, saved once (one Undo step).
+    await page.focus('.trim-hi');
+    for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
+    await page.waitForTimeout(1200);
+    saved = await videoNow();
+    const hiVal = await page.evaluate(() => Number(document.querySelector('.trim-hi').value));
+    check(saved.trim && Math.abs(saved.trim.end - hiVal) < 0.06 && Math.abs(d - hiVal - 1) < 0.15 && Math.abs(saved.trim.start - trimStart) < 0.06 && JSON.stringify(saved.cuts) === cutsBefore,
+      `end trim saved (${saved.trim && saved.trim.end} s, 1 s off the end), start and cuts kept`, `end trim: handle ${hiVal}, trim ${JSON.stringify(saved.trim)}, cuts ${JSON.stringify(saved.cuts)} of ${d}`);
+    const { editedDuration, withTrim } = await import('../public/timeline.js');
+    const want = editedDuration(withTrim(saved.cuts, saved.trim, d), d), shown = await total();
+    check(Math.abs(shown - want) <= 1, `player length follows the trim (${shown} s)`, `player shows ${shown} s, cuts and trim give ${want.toFixed(2)} s`);
+    if (nWords) {
+      const marks = await page.evaluate(() => ({ trimmed: document.querySelectorAll('.tc-body .w.trimmed').length, cut: document.querySelectorAll('.tc-body .w.cut').length }));
+      check(marks.trimmed > 0 && marks.cut >= 3, `transcript marks trimmed words (${marks.trimmed}) apart from cut ones (${marks.cut})`, `transcript marks: ${JSON.stringify(marks)}`);
+    }
+    // Play starts at the trimmed start.
+    await page.click('.sp-controls .sp-btn >> nth=0');
+    await page.waitForTimeout(200);
+    const t0 = await page.evaluate(() => { const m = document.querySelector('.sp-main'); m.pause(); return m.currentTime; });
+    check(t0 >= trimStart - 0.05 && t0 < trimStart + 1.5, `owner's Play starts at the trimmed start (${t0.toFixed(2)} s)`, `owner played from ${t0}, trim ${trimStart}`);
+    await shot('11b-trim.png');
+  }
+
   // ---------- export: one file, camera burnt in ----------
   if (!SPEECH && (MODE === 'screen-camera' || (await page.evaluate(() => (JSON.parse(document.getElementById('shuttle-data').textContent).video.cuts || []).length)) || true)) {
     const expected = await page.evaluate(() => {
@@ -590,47 +638,6 @@ try {
   const ownerSpeed = await page.evaluate(() => ({ rate: document.querySelector('.sp-main, .sp video').playbackRate, label: document.querySelector('.sp-speed').textContent }));
   check(ownerSpeed.rate === 1.2 && ownerSpeed.label === '1.2×', 'owner sets the starting speed (1.2×)', `owner speed: ${JSON.stringify(ownerSpeed)}`);
 
-  // ---------- trim the start and the end ----------
-  const savedCuts = async () => (await (await page.request.get(`${BASE}/api/videos/${meta.id}`)).json()).cuts || [];
-  const total = () => page.evaluate(() => { const [m, s] = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number); return m * 60 + s; });
-  let trimStart = 0;
-  {
-    await page.locator('.trim-row').scrollIntoViewIfNeeded();
-    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
-    const box = await page.locator('.trim').boundingBox();
-    // Drag the start handle a quarter of the way in with the mouse; the player shows that frame.
-    const y = box.y + box.height / 2, x0 = box.x + 7; // centre of the 14 px thumb at 0
-    await page.mouse.move(x0, y);
-    await page.mouse.down();
-    for (let i = 1; i <= 10; i++) await page.mouse.move(x0 + box.width * 0.25 * (i / 10), y);
-    await page.waitForTimeout(300);
-    const during = await page.evaluate(() => ({ t: document.querySelector('.sp-main').currentTime, paused: document.querySelector('.sp-main').paused, lo: Number(document.querySelector('.trim-lo').value), label: document.querySelector('.trim-label').textContent }));
-    await page.mouse.up();
-    await page.waitForTimeout(900); // debounced save
-    trimStart = during.lo;
-    check(during.paused && Math.abs(during.t - during.lo) < 0.15 && during.lo > d * 0.15,
-      `dragging the start handle previews that frame (${during.lo.toFixed(2)} s, "${during.label}")`, `start handle drag: ${JSON.stringify(during)} of ${d}`);
-    let cuts = await savedCuts();
-    check(cuts.length && cuts[0][0] === 0 && Math.abs(cuts[0][1] - trimStart) < 0.06, `start trim saved as a cut [0, ${cuts[0] && cuts[0][1]}]`, `start trim cuts: ${JSON.stringify(cuts)}`);
-    // The end handle from the keyboard: 20 steps of 0.05 s.
-    await page.focus('.trim-hi');
-    for (let i = 0; i < 20; i++) await page.keyboard.press('ArrowLeft');
-    await page.waitForTimeout(900);
-    cuts = await savedCuts();
-    const last = cuts[cuts.length - 1] || [];
-    const hiVal = await page.evaluate(() => Number(document.querySelector('.trim-hi').value));
-    check(Math.abs(last[0] - hiVal) < 0.06 && last[1] >= d - 0.06 && Math.abs(d - hiVal - 1) < 0.15, `end trim saved as a cut [${last[0]}, ${last[1]}] (1 s off the end)`, `end trim: handle ${hiVal}, cuts ${JSON.stringify(cuts)} of ${d}`);
-    const { editedDuration } = await import('../public/timeline.js');
-    const want = editedDuration(cuts, d), shown = await total();
-    check(Math.abs(shown - want) <= 1, `player length follows the trim (${shown} s)`, `player shows ${shown} s, cuts give ${want.toFixed(2)} s`);
-    // Play starts at the trimmed start.
-    await page.click('.sp-controls .sp-btn >> nth=0');
-    await page.waitForTimeout(200);
-    const t0 = await page.evaluate(() => { const m = document.querySelector('.sp-main'); m.pause(); return m.currentTime; });
-    check(t0 >= trimStart - 0.05 && t0 < trimStart + 1.5, `owner's Play starts at the trimmed start (${t0.toFixed(2)} s)`, `owner played from ${t0}, trim ${trimStart}`);
-    await shot('11b-trim.png');
-  }
-
   // A served file with more than one fragment carries a fragment index (sidx) in front of the
   // first, so Chrome starts it in one or two requests instead of reading every fragment first
   // (built in the background after complete). A short recording can be a single fragment, with
@@ -673,7 +680,7 @@ try {
   check(vSpeed === 1.2, 'viewer\'s player starts at the owner\'s speed', `viewer starts at ${vSpeed}`);
   await vpage.click('.sp-big'); // the controls appear once it's playing
   const vStart = await vpage.evaluate(() => document.querySelector('.sp-main').currentTime);
-  check(vStart >= trimStart - 0.05, `viewer's video starts after the trimmed start (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}, trim ${trimStart}`);
+  check(vStart >= trimStart - 0.05 && vStart < trimStart + 1, `viewer's video starts at the trimmed start (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}, trim ${trimStart}`);
   await vpage.waitForTimeout(600);
   await vpage.hover('.sp');
   await vpage.click('.sp-speed');
@@ -694,6 +701,7 @@ try {
   const playedByButton = !(await humanClick('.sp-controls .sp-btn >> nth=0'));
   check(pausedByButton && playedByButton, 'control-bar Pause and Play work at human click speed', `pause button: paused=${pausedByButton}, played again=${playedByButton}`);
   await vpage.waitForSelector('.tc-body .w', { timeout: 15000 }).catch(() => {});
+  const ownerKept = await page.evaluate(() => document.querySelectorAll('.tc-body .w:not(.cut):not(.trimmed)').length);
   const viewer = await vpage.evaluate(() => ({
     download: !!Array.from(document.querySelectorAll('button, a')).find((b) => /Download/.test(b.textContent)),
     panel: !document.querySelector('#owner-panel').hidden,
@@ -702,7 +710,7 @@ try {
     words: document.querySelectorAll('.tc-body .w').length,
   }));
   check(!viewer.download && !viewer.panel && !viewer.editable, 'viewer gets no download, layout or rename controls', `viewer controls: ${JSON.stringify(viewer)}`);
-  if (!SPEECH) check(viewer.cut === 0 && viewer.words < nWords, `viewer transcript hides cut words (${viewer.words} of ${nWords})`, `viewer sees cut words: ${JSON.stringify(viewer)}`);
+  if (!SPEECH) check(viewer.cut === 0 && viewer.words === ownerKept && viewer.words < nWords, `viewer transcript has only the words that play (${viewer.words} of ${nWords})`, `viewer words: ${JSON.stringify(viewer)}, owner's kept words ${ownerKept}`);
   const dl = await vpage.evaluate(({ id, cam }) => Promise.all([`/raw/${id}?download=1`, `/raw/${id}?DOWNLOAD`, cam ? `/raw/${id}/cam?Download=1` : null].filter(Boolean).map((u) => fetch(u).then((r) => r.status))), { id: meta.id, cam: meta.hasCam });
   check(dl.every((s) => s === 403), 'viewer download URLs refused (any spelling)', `viewer download statuses ${dl}`);
   if (meta.hasCam) {
@@ -724,15 +732,15 @@ try {
   await vpage.screenshot({ path: path.join(out, '12-viewer.png') });
   await vctx.close();
 
-  // Reset takes the trim off again (other cuts stay).
+  // Reset takes the trim off again; the cuts stay.
   {
-    const d = await page.evaluate(() => Number(document.querySelector('.trim-hi').max));
+    const before = await videoNow();
     await page.click('.trim-row button:has-text("Reset")');
     await page.waitForTimeout(900);
-    const cuts = await savedCuts();
-    const reset = await page.evaluate(() => ({ lo: Number(document.querySelector('.trim-lo').value), hi: Number(document.querySelector('.trim-hi').value), max: Number(document.querySelector('.trim-hi').max), btn: document.querySelector('.trim-row button').hidden }));
-    check(!cuts.some((c) => c[0] <= 0.01 || c[1] >= d - 0.01) && reset.lo === 0 && reset.hi >= reset.max - 0.06 && reset.btn,
-      'Reset removes the trim', `after Reset: cuts ${JSON.stringify(cuts)}, handles ${JSON.stringify(reset)}`);
+    const after = await videoNow();
+    const handles = await page.evaluate(() => ({ lo: Number(document.querySelector('.trim-lo').value), hi: Number(document.querySelector('.trim-hi').value), max: Number(document.querySelector('.trim-hi').max), resetHidden: document.querySelector('.trim-row button').hidden }));
+    check(before.trim && after.trim === null && after.cuts.length >= 1 && JSON.stringify(after.cuts) === JSON.stringify(before.cuts) && handles.lo === 0 && handles.hi >= handles.max - 0.06 && handles.resetHidden,
+      `Reset removes the trim and keeps the ${after.cuts.length} cut(s)`, `Reset: trim ${JSON.stringify(before.trim)} → ${JSON.stringify(after.trim)}, cuts ${JSON.stringify(before.cuts)} → ${JSON.stringify(after.cuts)}, handles ${JSON.stringify(handles)}`);
   }
 
   // library

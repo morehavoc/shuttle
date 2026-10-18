@@ -9,7 +9,7 @@
 import { renderSharePage, renderNotFound } from './share-page.js';
 import { transcribeWav, provider } from './transcribe.js';
 import { draftDescription, describeProvider } from './describe.js';
-import { normalizeCuts, isWordCut } from '../public/timeline.js';
+import { normalizeCuts, isWordCut, withTrim } from '../public/timeline.js';
 import { buildSidx, spliceRanges } from './mp4index.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
@@ -326,6 +326,10 @@ async function patchVideo(request, env, id, url) {
     const dur = v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7;
     sets.push('cuts = ?'); args.push(JSON.stringify(normalizeCuts(body.cuts, dur)));
   }
+  if (body.trim !== undefined) {
+    const t = cleanTrim(body.trim, v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7);
+    sets.push('trim_start = ?', 'trim_end = ?'); args.push(t.start, t.end);
+  }
   if (sets.length) {
     sets.push('updated_at = ?'); args.push(Date.now());
     await env.DB.prepare(`UPDATE videos SET ${sets.join(', ')} WHERE id = ?`).bind(...args, id).run();
@@ -444,12 +448,12 @@ async function transcriptOf(env, id, expected = -1) {
 }
 
 async function getTranscript(request, env, id) {
-  const v = await env.DB.prepare('SELECT status, cuts, audio_chunks, expires_at FROM videos WHERE id = ?').bind(id).first();
+  const v = await env.DB.prepare('SELECT status, cuts, trim_start, trim_end, audio_chunks, expires_at FROM videos WHERE id = ?').bind(id).first();
   if (!v || expired(v)) throw new HttpError(404, 'Not found');
   const t = await transcriptOf(env, id, v.status === 'ready' ? v.audio_chunks : -1);
   if (!(await isOwner(request, env))) {
-    // Viewers never get the words that were cut.
-    const cuts = parseJson(v.cuts, []);
+    // Viewers never get the words that were cut or trimmed.
+    const cuts = playCuts(v);
     t.words = t.words.filter((w) => !isWordCut(w, cuts));
     delete t.failed;
     delete t.missing;
@@ -484,7 +488,8 @@ async function maybeDescribe(env, id) {
     if (!v || v.status !== 'ready' || v.description_source !== '') return;
     const t = await transcriptOf(env, id, v.audio_chunks);
     if (t.status === 'pending' || t.status === 'none' || t.status === 'off') return;
-    const words = t.words.filter((w) => !isWordCut(w, parseJson(v.cuts, [])));
+    const cuts = playCuts(v);
+    const words = t.words.filter((w) => !isWordCut(w, cuts));
     if (words.length < 8) return;
     const claimed = await env.DB.prepare("UPDATE videos SET description_source = 'working' WHERE id = ? AND description_source = ''").bind(id).run();
     if (!claimed.meta || !claimed.meta.changes) return;
@@ -509,7 +514,8 @@ async function describeNow(env, id, url) {
   const v = await getVideo(env, id);
   if (!describeProvider(env)) throw new HttpError(409, 'Descriptions aren’t set up on this server');
   const t = await transcriptOf(env, id, v.audio_chunks);
-  const words = t.words.filter((w) => !isWordCut(w, parseJson(v.cuts, [])));
+  const cuts = playCuts(v);
+  const words = t.words.filter((w) => !isWordCut(w, cuts));
   if (words.length < 3) throw new HttpError(409, 'Not enough transcript to go on yet');
   const d = await draftDescription(env, words);
   await env.DB.prepare("UPDATE videos SET description_source = 'auto' WHERE id = ?").bind(id).run();
@@ -702,6 +708,7 @@ function publicVideo(v, url, owner = false) {
     hasCam: !!(v.cam_mime && (v.cam_size || v.cam_upload_id)), camMime: v.cam_mime || null, camOffsetMs: v.cam_offset_ms || 0,
     layout: parseJson(v.layout, null) || (v.cam_mime ? DEFAULT_LAYOUT : { kind: 'screen', corner: 'bl', size: 'm' }),
     cuts: parseJson(v.cuts, []),
+    trim: trimOf(v),
     description: v.description || '',
     speed: typeof v.speed === 'number' ? v.speed : null,
     createdAt: v.created_at,
@@ -716,6 +723,31 @@ function publicVideo(v, url, owner = false) {
   }
   if (url) out.shareUrl = `${url.origin}/v/${v.id}`;
   return out;
+}
+
+// The trim as stored: { start, end } in seconds (end null: to the end), or null for none.
+function trimOf(v) {
+  const start = typeof v.trim_start === 'number' ? v.trim_start : 0;
+  const end = typeof v.trim_end === 'number' ? v.trim_end : null;
+  return start > 0 || end !== null ? { start, end } : null;
+}
+
+// What playback skips (cuts and trim); viewers' transcripts and the description leave it out.
+function playCuts(v) {
+  return withTrim(parseJson(v.cuts, []), trimOf(v));
+}
+
+// A trim from the owner: null, or { start, end } with end null for "to the end". At least half
+// a second stays. Returns the two column values.
+function cleanTrim(t, max) {
+  if (t === null) return { start: null, end: null };
+  if (!t || typeof t !== 'object' || Array.isArray(t)) throw new HttpError(400, 'Bad trim');
+  const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? Math.round(x * 1000) / 1000 : NaN);
+  const start = t.start == null ? 0 : num(t.start);
+  const end = t.end == null ? null : num(t.end);
+  if (Number.isNaN(start) || start < 0 || start > max) throw new HttpError(400, 'Bad trim');
+  if (end !== null && (Number.isNaN(end) || end > max || end < start + 0.5)) throw new HttpError(400, 'Bad trim');
+  return { start: start > 0 ? start : null, end };
 }
 
 function cleanLayout(l) {
