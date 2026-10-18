@@ -747,7 +747,7 @@ try {
     await vpage.waitForSelector('.sp');
     const hidden = await vpage.evaluate((id) => Promise.all([fetch(`/raw/${id}/cam`, { headers: { Range: 'bytes=0-1' } }).then((r) => r.status), fetch(`/thumb/${id}/cam.jpg`).then((r) => r.status)])
       .then(([raw, thumb]) => ({ raw, thumb, el: !!document.querySelector('.sp-cam'), avatar: !!document.querySelector('img.avatar'), hasCam: JSON.parse(document.getElementById('shuttle-data').textContent).video.hasCam, og: document.querySelector('meta[property="og:image"]')?.content })), meta.id);
-    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s(&v=\d+)?$/.test(hidden.og || ''),
+    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s(&v=\w+)?$/.test(hidden.og || ''),
       'Screen layout: viewers get no camera file, camera thumbnail, avatar or face in the preview', `Screen layout leaks the camera: ${JSON.stringify(hidden)}`);
     await vpage.screenshot({ path: path.join(out, '12b-viewer-screen-layout.png') });
     const ownerCam = await page.evaluate(() => ({ el: !!document.querySelector('.sp-cam'), hidden: document.querySelector('.sp-cam-wrap')?.hidden }));

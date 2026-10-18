@@ -51,7 +51,7 @@ export class Player extends EventTarget {
     const v = this.v;
     this.main = h('video', {
       class: 'sp-main', playsinline: true, preload: 'metadata', controlslist: 'nodownload noplaybackrate', disablepictureinpicture: true,
-      poster: v.hasThumb ? `/thumb/${v.id}.jpg` : null,
+      poster: v.hasThumb ? `/thumb/${v.id}.jpg${v.rev ? `?v=${v.rev}` : ''}` : null,
     });
     this.main.src = `/raw/${v.id}`;
     this.mainWrap = h('div', { class: 'sp-main-wrap' }, this.main);

@@ -529,7 +529,7 @@ async function sharePage(request, env, id) {
   if (!v || expired(v)) return new Response(renderNotFound(), { status: 404, headers });
   const url = new URL(request.url);
   const owner = await isOwner(request, env);
-  return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '', version: v.updated_at || 0 }), { headers });
+  return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
 }
 
 async function rawVideo(request, env, ctx, id, track, url) {
@@ -709,6 +709,7 @@ function publicVideo(v, url, owner = false) {
     layout: parseJson(v.layout, null) || (v.cam_mime ? DEFAULT_LAYOUT : { kind: 'screen', corner: 'bl', size: 'm' }),
     cuts: parseJson(v.cuts, []),
     trim: trimOf(v),
+    rev: rev(v.updated_at),
     description: v.description || '',
     speed: typeof v.speed === 'number' ? v.speed : null,
     createdAt: v.created_at,
@@ -723,6 +724,14 @@ function publicVideo(v, url, owner = false) {
   }
   if (url) out.shareUrl = `${url.origin}/v/${v.id}`;
   return out;
+}
+
+// A short tag that changes whenever the video does (from its last-change time, without showing
+// it): versions the poster and link-preview URLs, so caches fetch a retaken picture.
+function rev(x) {
+  let h = 0x811c9dc5;
+  for (const c of String(x || 0)) { h ^= c.charCodeAt(0); h = Math.imul(h, 0x01000193) >>> 0; }
+  return h.toString(36);
 }
 
 // The trim as stored: { start, end } in seconds (end null: to the end), or null for none.
