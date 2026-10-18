@@ -269,6 +269,7 @@ a { color: inherit; }
   pointer-events: auto; width: 10px; height: 22px; border-radius: 5px; background: #fff; border: 2px solid var(--accent); cursor: ew-resize;
 }
 .trim-label { font-variant-numeric: tabular-nums; min-width: 96px; }
+.offscreen { position: fixed; left: -10000px; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
 .seg-inline { display: inline-flex; gap: 2px; padding: 3px; }
 .seg-inline button { display: block; padding: 6px 12px; font-size: 13px; }
 .seg-small button { padding: 6px 10px; }

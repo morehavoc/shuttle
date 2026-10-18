@@ -280,13 +280,63 @@ function trimRow() {
     // Inside the edge nothing is trimmed yet; the handle stays where it was let go (re-reading
     // the trim would put it back at the end, and arrow keys could never step out of the edge).
     if (next.start === trim.start && next.end === trim.end) return;
+    const moved = next.start !== trim.start;
     apply(cuts, next.start > 0 || next.end !== null ? 'Trimmed' : 'Trim removed', { trim: next });
+    if (moved) retakeThumbs();
   }
   onCutsChanged = sync;
   for (const ev of ['loadedmetadata', 'durationchange']) player.main.addEventListener(ev, sync); // the real length may arrive later
   sync();
   return h('div', { class: 'layout-row trim-row' }, h('span', { class: 'row-label' }, 'Trim'),
     h('div', { class: 'trim' }, h('div', { class: 'trim-rail' }), fill, lo, hi), label, reset);
+}
+
+// The poster and the link preview are taken 3 s into the recording, which is just what a start
+// trim cuts off. Take them again from the new start, from hidden copies of the video so the
+// player doesn't move. Best effort: on any failure the old pictures stay.
+let thumbsJob = 0;
+async function retakeThumbs() {
+  const job = ++thumbsJob;
+  await new Promise((r) => setTimeout(r, 800)); // a run of changes takes one picture
+  if (job !== thumbsJob) return;
+  const els = [];
+  try {
+    const { makeThumbs } = await import('./recorder.js');
+    const end = trim.end === null ? duration() : trim.end;
+    const t = Math.max(0, Math.min(trim.start > 0 ? trim.start + 0.5 : 3, end - 0.2));
+    const frame = async (src, at) => {
+      const el = h('video', { muted: true, playsinline: true, preload: 'auto', class: 'offscreen' });
+      els.push(el);
+      document.body.append(el);
+      el.src = src;
+      await mediaEvent(el, 'loadedmetadata');
+      el.currentTime = Math.max(0, Math.min(at, (Number.isFinite(el.duration) ? el.duration : at) - 0.05));
+      await mediaEvent(el, 'seeked');
+      if (el.readyState < 2) await mediaEvent(el, 'loadeddata');
+      return el;
+    };
+    const main = await frame(`/raw/${v.id}`, t);
+    const cam = player.cam ? await frame(`/raw/${v.id}/cam`, t - (v.camOffsetMs || 0) / 1000) : null;
+    if (job !== thumbsJob) return;
+    const camera = v.mode === 'camera';
+    const thumbs = await makeThumbs({ screenVideo: camera ? null : main, cameraVideo: camera ? main : cam, mode: v.mode, layout: player.hasCam ? player.layout : null });
+    for (const [variant, blob] of Object.entries(thumbs)) {
+      if (!blob || job !== thumbsJob) continue;
+      await fetch(`/api/videos/${v.id}/thumb?variant=${variant}`, { method: 'PUT', body: blob, credentials: 'same-origin' });
+    }
+  } catch (e) {
+    console.warn('thumbnails not retaken:', e && e.message);
+  } finally {
+    for (const el of els) { el.removeAttribute('src'); el.load(); el.remove(); }
+  }
+}
+
+function mediaEvent(el, name, ms = 15000) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => { el.removeEventListener(name, done); reject(new Error(`no ${name}`)); }, ms);
+    function done() { clearTimeout(t); resolve(); }
+    el.addEventListener(name, done, { once: true });
+  });
 }
 
 const SPEED_CHOICES = [1, 1.2, 1.5, 2];

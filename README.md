@@ -30,7 +30,7 @@ Record your screen and camera, get a link. Styled after christophermoravec.com (
 
 Links are public by unguessable id (12 characters, about 70 bits). Everything else needs the owner password.
 
-**What "cut" means:** edits are skipped during playback. They are not removed from the file. The full recording stays reachable at `/raw/<id>` (it has to be public to stream), and the cut ranges are in the page. Don't rely on a cut to hide something sensitive; re-record instead.
+**What "cut" and "trim" mean:** edits are skipped during playback. They are not removed from the file. The full recording stays reachable at `/raw/<id>` (it has to be public to stream), and the cut and trim ranges are in the page. Don't rely on either to hide something sensitive; re-record instead. A start trim takes the poster and the link-preview picture again from the new start, but a preview already shown in a chat keeps the old picture.
 
 ## Deploy
 

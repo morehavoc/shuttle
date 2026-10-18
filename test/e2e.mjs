@@ -552,6 +552,8 @@ try {
   const videoNow = async () => (await page.request.get(`${BASE}/api/videos/${meta.id}`)).json();
   const total = () => page.evaluate(() => { const [m, s] = document.querySelector('.sp-time').textContent.split('/')[1].trim().split(':').map(Number); return m * 60 + s; });
   let trimStart = 0;
+  const posterNow = async () => Buffer.from(await (await page.request.get(`${BASE}/thumb/${meta.id}.jpg`)).body());
+  const posterBefore = await posterNow();
   {
     const cutsBefore = JSON.stringify((await videoNow()).cuts);
     await page.locator('.trim-row').scrollIntoViewIfNeeded();
@@ -631,6 +633,16 @@ try {
       execFileSync('ffmpeg', ['-y', '-loglevel', 'error', '-ss', String(Math.max(1, dur / 2)), '-i', f, '-frames:v', '1', frame]);
       ok(`export frame saved (${path.basename(frame)})`);
     }
+  }
+
+  // A start trim takes the poster again from the new start (it was taken 3 s in, inside the trim).
+  {
+    let changed = false;
+    for (let i = 0; i < 40 && !changed; i++) {
+      changed = !(await posterNow()).equals(posterBefore);
+      if (!changed) await page.waitForTimeout(500);
+    }
+    check(changed, 'poster taken again from the trimmed start', 'poster unchanged 20 s after the start trim');
   }
 
   // The stored screen file must decode cleanly end to end (a broken stretch stops Chrome's
@@ -735,7 +747,7 @@ try {
     await vpage.waitForSelector('.sp');
     const hidden = await vpage.evaluate((id) => Promise.all([fetch(`/raw/${id}/cam`, { headers: { Range: 'bytes=0-1' } }).then((r) => r.status), fetch(`/thumb/${id}/cam.jpg`).then((r) => r.status)])
       .then(([raw, thumb]) => ({ raw, thumb, el: !!document.querySelector('.sp-cam'), avatar: !!document.querySelector('img.avatar'), hasCam: JSON.parse(document.getElementById('shuttle-data').textContent).video.hasCam, og: document.querySelector('meta[property="og:image"]')?.content })), meta.id);
-    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s$/.test(hidden.og || ''),
+    check(hidden.raw === 404 && hidden.thumb === 404 && !hidden.el && !hidden.avatar && !hidden.hasCam && /\?l=s(&v=\d+)?$/.test(hidden.og || ''),
       'Screen layout: viewers get no camera file, camera thumbnail, avatar or face in the preview', `Screen layout leaks the camera: ${JSON.stringify(hidden)}`);
     await vpage.screenshot({ path: path.join(out, '12b-viewer-screen-layout.png') });
     const ownerCam = await page.evaluate(() => ({ el: !!document.querySelector('.sp-cam'), hidden: document.querySelector('.sp-cam-wrap')?.hidden }));

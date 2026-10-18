@@ -529,7 +529,7 @@ async function sharePage(request, env, id) {
   if (!v || expired(v)) return new Response(renderNotFound(), { status: 404, headers });
   const url = new URL(request.url);
   const owner = await isOwner(request, env);
-  return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
+  return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '', version: v.updated_at || 0 }), { headers });
 }
 
 async function rawVideo(request, env, ctx, id, track, url) {

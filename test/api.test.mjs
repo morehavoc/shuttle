@@ -287,7 +287,7 @@ try {
     assert.ok(og.equals(poster), 'link preview is the plain poster');
     const html = await (await call(`/v/${id}`, { anon: true })).text();
     assert.match(html, /"hasCam":false/);
-    assert.match(html, /og\.jpg\?l=s"/);
+    assert.match(html, /og\.jpg\?l=s&amp;v=\d+"/);
     assert.doesNotMatch(html, /class="avatar" src=/);
     const page = await (await call(`/v/${id}`)).text();
     assert.match(page, /"hasCam":true/, 'owner page keeps the camera to switch back');
@@ -340,7 +340,7 @@ try {
   await test('share page: link-preview tags, escaped title, owner flag, no owner-only fields for viewers', async () => {
     await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: 'Hello <script>alert(1)</script> & "q"' } });
     const html = await (await call(`/v/${id}`, { anon: true })).text();
-    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\/[A-Za-z0-9]+\/og\.jpg\?l=c"/);
+    assert.match(html, /<meta property="og:image" content="http:\/\/127\.0\.0\.1:\d+\/thumb\/[A-Za-z0-9]+\/og\.jpg\?l=c&amp;v=\d+"/);
     assert.doesNotMatch(html, /og:video/);
     assert.match(html, /Hello &lt;script&gt;alert\(1\)&lt;\/script&gt; &amp; &quot;q&quot;/);
     assert.doesNotMatch(html, /<script>alert/);
