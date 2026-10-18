@@ -384,6 +384,42 @@ try {
     assert.equal((await call('/_headers', { anon: true })).status, 404, 'the _headers file itself is not served');
   });
 
+  await test('embed: /e/ is the only framable page, viewer-only, and oEmbed answers with an iframe of it', async () => {
+    const r = await call(`/e/${id}`); // even with the owner's cookie it renders for a viewer
+    assert.equal(r.status, 200);
+    const csp = r.headers.get('content-security-policy') || '';
+    assert.match(csp, /frame-ancestors \*/, csp);
+    assert.doesNotMatch(csp, /unsafe-inline|unsafe-eval/);
+    const html = await r.text();
+    assert.match(html, /<script src="\/embed\.js" type="module">/);
+    assert.doesNotMatch(html, /"owner":true|"views"|"surface"/);
+    for (const tag of html.match(/<script\b[^>]*>/g)) assert.match(tag, /\bsrc=|type="application\/json"/, tag);
+    assert.doesNotMatch(html, /\son[a-z]+=|\sstyle=/i);
+    assert.equal((await call('/e/nosuchvideo1', { anon: true })).status, 404);
+    // The share page names the oEmbed endpoint, so Ghost and friends find it from a pasted link.
+    const page = await (await call(`/v/${id}`, { anon: true })).text();
+    const href = page.match(/<link rel="alternate" type="application\/json\+oembed" href="([^"]+)"/)[1].replace(/&amp;/g, '&');
+    const o = await call(href.replace(BASE, ''), { anon: true });
+    assert.equal(o.status, 200);
+    assert.equal(o.headers.get('access-control-allow-origin'), '*');
+    const oe = await j(o);
+    assert.equal(oe.type, 'video'); assert.equal(oe.version, '1.0');
+    assert.equal(oe.width, 640); assert.equal(oe.height, 360);
+    assert.match(oe.html, new RegExp(`^<iframe src="${BASE.replace(/[.]/g, '\\.')}/e/${id}" width="640" height="360"`));
+    assert.match(oe.html, /title="Hello &lt;script&gt;/, 'the title is escaped inside the iframe tag');
+    assert.match(oe.thumbnail_url, /\/thumb\/\w+\/og\.jpg/);
+    const small = await j(await call(`/oembed?url=${encodeURIComponent(`${BASE}/v/${id}`)}&maxwidth=400`, { anon: true }));
+    assert.deepEqual([small.width, small.height], [400, 225]);
+    const short = await j(await call(`/oembed?url=${encodeURIComponent(`${BASE}/e/${id}`)}&maxheight=180`, { anon: true }));
+    assert.deepEqual([short.width, short.height], [320, 180]);
+    for (const bad of [`https://example.com/v/${id}`, `${BASE}/v/nosuchvideo1`, `${BASE}/api/videos/${id}`, 'nonsense']) {
+      assert.equal((await call(`/oembed?url=${encodeURIComponent(bad)}`, { anon: true })).status, 404, bad);
+    }
+    assert.equal((await call(`/oembed?format=xml&url=${encodeURIComponent(`${BASE}/v/${id}`)}`, { anon: true })).status, 501);
+    // Every other page still refuses to be framed.
+    assert.match((await call(`/v/${id}`, { anon: true })).headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  });
+
   await test('empty title refused', async () => {
     assert.equal((await call(`/api/videos/${id}`, { method: 'PATCH', body: { title: '   ' } })).status, 400);
   });

@@ -6,7 +6,7 @@
 // mode) and `cam` (the camera, video only), composited by the player. Edits are cut ranges
 // applied at playback; the files are never rewritten.
 
-import { renderSharePage, renderNotFound } from './share-page.js';
+import { renderSharePage, renderEmbedPage, renderNotFound } from './share-page.js';
 import { transcribeWav, provider } from './transcribe.js';
 import { draftDescription, describeProvider } from './describe.js';
 import { normalizeCuts, isWordCut, withTrim } from '../public/timeline.js';
@@ -85,6 +85,8 @@ async function route(request, env, ctx) {
 
   // Public reads (the id is the capability).
   if (match(new RegExp(`^/v/${ID}/?$`)) && method === 'GET') return sharePage(request, env, m[1]);
+  if (match(new RegExp(`^/e/${ID}/?$`)) && method === 'GET') return embedPage(request, env, m[1]);
+  if (path === '/oembed' && method === 'GET') return oembed(env, url);
   if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, ctx, m[1], m[2] || 'main', url);
   if (match(new RegExp(`^/thumb/${ID}(?:/(cam|og))?(?:\\.jpg)?$`)) && method === 'GET') return thumb(request, env, m[1], m[2] || 'poster');
   if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(env, m[1]);
@@ -589,6 +591,48 @@ async function sharePage(request, env, id) {
   return new Response(renderSharePage(publicVideo(v, url, owner), { owner, origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
 }
 
+// The player alone, for an <iframe> on any site: the only page another site may frame.
+async function embedPage(request, env, id) {
+  const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
+  const headers = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders({ framable: true }) };
+  if (!v || expired(v)) return new Response(renderNotFound(), { status: 404, headers });
+  const url = new URL(request.url);
+  return new Response(renderEmbedPage(publicVideo(v, url, false), { origin: url.origin, ownerName: env.OWNER_NAME || '' }), { headers });
+}
+
+// oEmbed (https://oembed.com): what Ghost, WordPress, Notion and others ask when a link is
+// pasted. The share page names this endpoint in a <link>, and the answer is an <iframe> of /e/.
+const EMBED_W = 640, EMBED_H = 360;
+async function oembed(env, url) {
+  const cors = { 'Access-Control-Allow-Origin': '*' };
+  const format = url.searchParams.get('format') || 'json';
+  if (format !== 'json') return json({ error: 'Only json' }, 501, cors);
+  let target;
+  try { target = new URL(url.searchParams.get('url') || ''); } catch { return json({ error: 'Bad url' }, 404, cors); }
+  const m = target.origin === url.origin && target.pathname.match(new RegExp(`^/[ve]/${ID}/?$`));
+  if (!m) return json({ error: 'Not a video here' }, 404, cors);
+  const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(m[1]).first();
+  if (!v || expired(v) || v.status !== 'ready') return json({ error: 'Not found' }, 404, cors);
+  const pv = publicVideo(v, url, false);
+  // The player is always 16:9. Fit maxwidth/maxheight when the consumer gives them.
+  const maxW = clampInt(url.searchParams.get('maxwidth'), 0, 4000), maxH = clampInt(url.searchParams.get('maxheight'), 0, 4000);
+  let w = EMBED_W;
+  if (maxW) w = Math.min(w, maxW);
+  if (maxH) w = Math.min(w, Math.floor(maxH * 16 / 9));
+  w = Math.max(w, 160);
+  const h = Math.round(w * 9 / 16);
+  const src = `${url.origin}/e/${pv.id}`;
+  const title = String(pv.title || 'Video').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const out = {
+    version: '1.0', type: 'video', provider_name: 'Shuttle', provider_url: url.origin,
+    title: pv.title || 'Video', width: w, height: h,
+    html: `<iframe src="${src}" width="${w}" height="${h}" style="border:0;width:100%;height:auto;aspect-ratio:16/9" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen loading="lazy" title="${title}"></iframe>`,
+  };
+  if (env.OWNER_NAME) out.author_name = env.OWNER_NAME;
+  if (pv.hasThumb || pv.hasOg) Object.assign(out, { thumbnail_url: `${url.origin}/thumb/${pv.id}/og.jpg${pv.rev ? `?v=${pv.rev}` : ''}`, thumbnail_width: 1280, thumbnail_height: 720 });
+  return json(out, 200, { ...cors, 'Cache-Control': 'public, max-age=300' });
+}
+
 async function rawVideo(request, env, ctx, id, track, url) {
   const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at, mp4_index FROM videos WHERE id = ?').bind(id).first();
   if (!v || v.status !== 'ready' || expired(v)) return new Response('Not found', { status: 404 });
@@ -975,12 +1019,13 @@ const CSP = "default-src 'self'; script-src 'self'; style-src 'self' https://fon
 // request from env, which is the same for every request an isolate serves.
 let hsts = false;
 
-function securityHeaders() {
+// `framable`: only the embed page (/e/) may be shown inside another site's <iframe>.
+function securityHeaders({ framable = false } = {}) {
   return {
     ...(hsts ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}),
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
-    'Content-Security-Policy': CSP,
+    'Content-Security-Policy': framable ? CSP.replace("frame-ancestors 'none'", 'frame-ancestors *') : CSP,
   };
 }
 

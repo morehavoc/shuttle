@@ -477,3 +477,9 @@ h1, h2, .title, .brand, .who, .sheet-head h2, .stage-title { font-family: var(--
 .description[contenteditable]:focus { background: var(--panel); box-shadow: 0 0 0 2px var(--accent); color: var(--text); }
 .desc-write { font-size: 13px; margin-top: 6px; }
 .row-note { font-size: 13px; color: var(--muted); }
+
+/* ---------- embed (/e/): the player filling another site's frame ---------- */
+body.embed { margin: 0; background: #0b0b0d; overflow: hidden; }
+body.embed .player-host { width: 100vw; height: 100vh; display: grid; place-items: center; }
+body.embed .sp { border-radius: 0; box-shadow: none; max-height: 100vh; max-width: calc(100vh * 16 / 9); }
+body.embed .player-pending { color: #cfc9bf; font-size: 14px; }
