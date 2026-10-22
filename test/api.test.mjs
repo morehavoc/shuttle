@@ -15,6 +15,7 @@ const BASE = process.env.BASE || `http://127.0.0.1:${PORT}`;
 const PASSWORD = 'test-password-123';
 let server;
 let serverLog = '';
+let logFromEdited = null;
 
 // Never let a local run pick up Cloudflare credentials from the environment.
 export function cleanEnv() {
@@ -48,7 +49,8 @@ async function call(p, opts = {}) {
   if (cookie && !opts.anon) headers.Cookie = cookie;
   let body = opts.body;
   if (body && !(body instanceof Uint8Array) && !(body instanceof ArrayBuffer) && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
-  return fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' });
+  return fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' })
+    .catch((e) => { e.message += ` (${opts.method || 'GET'} ${p})`; throw e; });
 }
 const j = async (r) => { const t = await r.text(); try { return JSON.parse(t); } catch { throw new Error(`not JSON (${r.status}): ${t.slice(0, 200)}`); } };
 
@@ -560,6 +562,7 @@ try {
   });
 
   // ---------- the viewers' copy of an edited video ----------
+  logFromEdited = serverLog.length;
   const media = await import('./media-fixtures.mjs');
   const { Timeline, effectiveCuts } = await import('../src/redact.js');
   const d1 = (sql) => execFileSync('npx', ['wrangler', 'd1', 'execute', 'shuttle', '--local', '--env', 'local', '--persist-to', '.wrangler/test-state', '--json', '--command', sql],
@@ -1024,6 +1027,7 @@ try {
 }
 const failed = results.filter((r) => r[0] === 'FAIL').length;
 // On a failure, what the server said (errors and the requests around them).
+if (failed && serverLog && typeof logFromEdited === 'number') console.log('\n--- server log from the edited-video tests (first 60 lines) ---\n' + serverLog.slice(logFromEdited).split('\n').filter((l) => !/WARNING|env\.local|"ai"|not what you|Please add|^\s*$/.test(l)).slice(0, 60).join('\n'));
 if (failed && serverLog) {
   const lines = serverLog.split('\n').filter((l) => !/WARNING|env\.local|"ai"|not what you|Please add|^\s*$|POST \/api\/login/.test(l));
   const bad = lines.map((l, i) => (/error|exception|uncaught|✘|terminated|socket|redact|[45]\d\d (?!Unauthorized|Not Found)/i.test(l) ? i : -1)).filter((i) => i >= 0);
