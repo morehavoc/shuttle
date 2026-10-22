@@ -1024,6 +1024,12 @@ try {
 }
 const failed = results.filter((r) => r[0] === 'FAIL').length;
 // On a failure, what the server said (errors and the requests around them).
-if (failed && serverLog) console.log('\n--- server log (last 120 lines, warnings left out) ---\n' + serverLog.split('\n').filter((l) => !/WARNING|env\.local|"ai"|not what you|Please add|^\s*$/.test(l)).slice(-120).join('\n'));
+if (failed && serverLog) {
+  const lines = serverLog.split('\n').filter((l) => !/WARNING|env\.local|"ai"|not what you|Please add|^\s*$|POST \/api\/login/.test(l));
+  const bad = lines.map((l, i) => (/error|exception|uncaught|✘|terminated|socket|redact|[45]\d\d (?!Unauthorized|Not Found)/i.test(l) ? i : -1)).filter((i) => i >= 0);
+  console.log('\n--- server log: errors and the lines around them ---');
+  const shown = new Set();
+  for (const i of bad.slice(0, 40)) for (let k = Math.max(0, i - 3); k <= Math.min(lines.length - 1, i + 6); k++) if (!shown.has(k)) { shown.add(k); console.log(lines[k]); }
+}
 console.log(`\n${results.length - failed}/${results.length} passed`);
 process.exit(failed ? 1 : 0);
