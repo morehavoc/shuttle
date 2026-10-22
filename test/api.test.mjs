@@ -49,7 +49,10 @@ async function call(p, opts = {}) {
   if (cookie && !opts.anon) headers.Cookie = cookie;
   let body = opts.body;
   if (body && !(body instanceof Uint8Array) && !(body instanceof ArrayBuffer) && typeof body !== 'string') { body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
-  return fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' })
+  const go = () => fetch(BASE + p, { method: opts.method || 'GET', headers, body, redirect: 'manual' });
+  // A kept-alive connection the server closed while the test was busy elsewhere (making fixtures
+  // with ffmpeg on a slow runner) fails before the request is sent: once more on a new one.
+  return go().catch((e) => (e.cause && e.cause.code === 'UND_ERR_SOCKET' ? go() : Promise.reject(e)))
     .catch((e) => { e.message += ` (${opts.method || 'GET'} ${p})`; throw e; });
 }
 const j = async (r) => { const t = await r.text(); try { return JSON.parse(t); } catch { throw new Error(`not JSON (${r.status}): ${t.slice(0, 200)}`); } };
@@ -70,6 +73,15 @@ async function test(name, fn) {
   try { await fn(); results.push(['ok', name]); console.log('  ok  ', name); }
   catch (e) { results.push(['FAIL', name]); console.log('  FAIL', name, '\n       ', e.message, e.cause ? `(${e.cause.code || ''} ${e.cause.message || e.cause})` : ''); }
 }
+
+// The edited-video recordings, made before the server starts (ffmpeg takes a while on CI).
+const editFixtures = await (async () => {
+  const media = await import('./media-fixtures.mjs');
+  return {
+    mainFile: media.fixture('api-main.mp4', { secret: [[0, 0.7], [3.3, 4.6], [6.2, 6.5], [9.4, 99]] }),
+    camFile: media.fixture('api-cam.mp4', { audio: false }),
+  };
+})();
 
 try {
   await startServer();
@@ -602,9 +614,7 @@ try {
   }
 
   const CUTS = [[3.3, 4.6], [6.2, 6.5]], TRIM = { start: 0.7, end: 9.4 };
-  const SECRETS = [[0, 0.7], [3.3, 4.6], [6.2, 6.5], [9.4, 99]];
-  const mainFile = media.fixture('api-main.mp4', { secret: SECRETS });
-  const camFile = media.fixture('api-cam.mp4', { audio: false });
+  const { mainFile, camFile } = editFixtures;
   let rid, firstVer;
 
   await test('edited video: viewers get a copy without the cut parts, never the stored file', async () => {
