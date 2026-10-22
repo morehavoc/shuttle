@@ -225,6 +225,7 @@ function ownerPanel() {
     parts.push(h('div', { class: 'layout-row' }, h('span', { class: 'row-label' }, 'Layout'), kinds, corners, sizes));
   }
   parts.push(trimRow());
+  parts.push(sharedRow());
   parts.push(speedRow());
   parts.push(keepRow());
   if (parts.length) { panel.replaceChildren(...parts); panel.hidden = false; }
@@ -376,6 +377,44 @@ function speedRow() {
 }
 
 const KEEP = [{ d: 7, label: '7 days' }, { d: 30, label: '30 days' }, { d: 90, label: '90 days' }, { d: 'forever', label: 'Forever' }];
+// What viewers get once there are edits: a copy with the trimmed and cut parts taken out of the
+// file, built on the server in the background. While this page is open it keeps the build going.
+let sharedSync = () => {};
+function sharedRow() {
+  const note = h('span', { class: 'row-note shared-note' });
+  const row = h('div', { class: 'layout-row shared-row' }, h('span', { class: 'row-label' }, 'Shared'), note);
+  let busy = false;
+  const retry = h('button', { class: 'btn btn-sm', type: 'button', onclick: () => drive(true) }, 'Try again');
+  sharedSync = (state = v.shared) => {
+    v.shared = state;
+    row.hidden = !state || state === 'none';
+    const text = {
+      pending: 'Removing your edits from the shared file…',
+      ready: 'Viewers get a copy with your trims and cuts removed.',
+      unsupported: 'This recording can’t be cut on the server: the shared file still has the trimmed and cut parts.',
+      failed: 'Couldn’t remove your edits from the shared file. Viewers see “updating” for now.',
+    }[state] || '';
+    note.replaceChildren(...(state === 'pending' ? [h('span', { class: 'spin-sm' })] : []), text, ...(state === 'failed' ? [' ', retry] : []));
+    if (state === 'pending') drive(false);
+  };
+  async function drive(again) {
+    if (busy) return;
+    busy = true;
+    try {
+      for (let i = 0; i < 200; i++) {
+        const r = await api(`/api/videos/${v.id}/redact`, { method: 'POST', body: again && i === 0 ? { retry: true } : {} });
+        v.shared = r.shared;
+        if (r.shared !== 'pending') break;
+        await new Promise((res) => setTimeout(res, 1500));
+      }
+    } catch {} // the server keeps going on its own; this page only speeds it up
+    busy = false;
+    sharedSync(v.shared);
+  }
+  sharedSync();
+  return row;
+}
+
 function keepRow() {
   const note = h('span', { class: 'row-note' });
   const seg = h('div', { class: 'seg seg-inline', role: 'group', 'aria-label': 'Keep for' },
@@ -589,8 +628,10 @@ async function save() {
   saving = true;
   do {
     saveAgain = false;
-    try { await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts, trim: hasTrim() ? trim : null } }); }
-    catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
+    try {
+      const out = await api(`/api/videos/${v.id}`, { method: 'PATCH', body: { cuts, trim: hasTrim() ? trim : null } });
+      sharedSync(out.shared);
+    } catch (e) { toast(`Not saved: ${e.message}`, { bad: true }); }
   } while (saveAgain);
   saving = false;
 }
@@ -699,10 +740,14 @@ if (v.status === 'ready') {
   if (owner) ownerPanel();
   loadTranscript();
 } else {
-  // Still uploading: wait, then reload into the player.
+  // Still uploading (or, for a viewer, the edited copy is being made): wait, then reload into the player.
   const started = Date.now();
+  const updating = v.status === 'updating';
   const poll = async () => {
-    if (Date.now() - started > 15 * 60e3) { $('#pending').innerHTML = '<p>This recording didn’t finish.</p>'; return; }
+    if (Date.now() - started > (updating ? 60 : 15) * 60e3) {
+      $('#pending').innerHTML = updating ? '<p>This video is still being updated. Try again later.</p>' : '<p>This recording didn’t finish.</p>';
+      return;
+    }
     try {
       const s = await api(`/api/videos/${v.id}/status`);
       if (s.status === 'ready') return location.reload();

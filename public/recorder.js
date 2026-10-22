@@ -433,9 +433,15 @@ export class Session extends EventTarget {
     const opts = { videoBitsPerSecond: bitrate };
     if (track === 'main') opts.audioBitsPerSecond = 128_000;
     if (mime) opts.mimeType = mime;
+    // A key frame every second: the server can only cut a shared copy at key frames (see the
+    // server's redact.js), and Chrome left to itself puts them 3-4 s apart on a still screen.
+    // Safari does one a second already; a browser that doesn't know the option ignores it.
     let rec;
-    try { rec = new MediaRecorder(stream, opts); }
-    catch { rec = new MediaRecorder(stream); }
+    try { rec = new MediaRecorder(stream, { ...opts, videoKeyFrameIntervalDuration: 1000 }); }
+    catch {
+      try { rec = new MediaRecorder(stream, opts); }
+      catch { rec = new MediaRecorder(stream); }
+    }
     rec.addEventListener('dataavailable', (e) => {
       if (!e.data || !e.data.size) return;
       this.chunks[track].push(e.data);

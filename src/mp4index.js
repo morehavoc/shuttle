@@ -30,7 +30,7 @@ const typeOf = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3])
 
 // The box header at o: { type, start, size, hdr }, or null if there isn't a sane one before `to`.
 // size 0 ("to the end of the file") comes back as 0: only the caller knows where the file ends.
-function boxAt(b, o, to) {
+export function boxAt(b, o, to) {
   if (o + 8 > to) return null;
   const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
   let size = dv.getUint32(o);
@@ -47,7 +47,7 @@ function boxAt(b, o, to) {
 }
 
 // The boxes inside a parent, each wholly inside it (a child running past its parent ends the list).
-function boxesIn(b, from, to) {
+export function boxesIn(b, from, to) {
   to = Math.min(to, b.length);
   const out = [];
   for (let o = from; ;) {
@@ -239,18 +239,26 @@ export async function buildSidx(read, size) {
   });
   if (refs.some((r) => r.bytes <= 0 || r.bytes > 0x7fffffff || r.duration > 0xffffffff)) return null;
 
-  const len = 8 + 4 + 4 + 4 + 8 + 8 + 2 + 2 + refs.length * 12;
+  const out = sidxBox(video.id, video.timescale, frags[0].time, refs);
+  if (!out) return null;
+  return { at: firstMoofAt, sidx: out };
+}
+
+// A version-1 sidx box for `refs` ({ bytes, duration, sync }, one per fragment, in order), the
+// first fragment following the box directly; null if it can't hold them.
+export function sidxBox(trackId, timescale, firstTime, refs) {
   if (refs.length > 0xffff) return null;
+  const len = 8 + 4 + 4 + 4 + 8 + 8 + 2 + 2 + refs.length * 12;
   const out = new Uint8Array(len);
   const dv = new DataView(out.buffer);
   dv.setUint32(0, len);
   out.set(enc('sidx'), 4);
   dv.setUint32(8, 0x01000000); // version 1, flags 0
-  dv.setUint32(12, video.id); // reference_ID
-  dv.setUint32(16, video.timescale);
+  dv.setUint32(12, trackId); // reference_ID
+  dv.setUint32(16, timescale);
   // earliest_presentation_time. Decode times stand in for presentation times: MediaRecorder
   // writes no B-frames, so they are the same.
-  dv.setBigUint64(20, BigInt(frags[0].time));
+  dv.setBigUint64(20, BigInt(firstTime));
   dv.setBigUint64(28, 0n); // first_offset: the first fragment follows this box
   dv.setUint16(36, 0);
   dv.setUint16(38, refs.length);
@@ -260,7 +268,7 @@ export async function buildSidx(read, size) {
     dv.setUint32(o + 4, r.duration);
     dv.setUint32(o + 8, r.sync ? 0x90000000 : 0); // starts_with_SAP, SAP_type 1
   });
-  return { at: firstMoofAt, sidx: out };
+  return out;
 }
 
 // The pieces of the served file (original with `insertLen` bytes inserted at `at`) that cover

@@ -12,6 +12,8 @@ FAKE_VAR="--var TRANSCRIBE_FAKE:1"
 [ -n "$INDEX_DELAY_MS" ] && FAKE_VAR="$FAKE_VAR --var INDEX_DELAY_MS:$INDEX_DELAY_MS"
 # INDEX_WAIT_MS=2000: "complete" stops waiting for the index sooner than its 15 s.
 [ -n "$INDEX_WAIT_MS" ] && FAKE_VAR="$FAKE_VAR --var INDEX_WAIT_MS:$INDEX_WAIT_MS"
+# REDACT_STEP_MS=500: an edited video's copy is built in steps this short (many of them).
+[ -n "$REDACT_STEP_MS" ] && FAKE_VAR="$FAKE_VAR --var REDACT_STEP_MS:$REDACT_STEP_MS"
 mkdir -p test/out
 npx wrangler d1 migrations apply shuttle --local --env local --persist-to .wrangler/e2e-state >/dev/null 2>&1
 npx wrangler dev --env local --port "$PORT" --ip 100.102.103.67 --local-protocol https \

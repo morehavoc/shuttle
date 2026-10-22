@@ -4,13 +4,15 @@
 //
 // A recording has up to two tracks: `main` (screen + all audio, or the camera in camera-only
 // mode) and `cam` (the camera, video only), composited by the player. Edits are cut ranges
-// applied at playback; the files are never rewritten.
+// applied at playback for the owner, whose files are never rewritten; viewers of an edited video
+// get a copy with the edited-out parts removed (redact.js), built in the background.
 
 import { renderSharePage, renderEmbedPage, renderNotFound } from './share-page.js';
 import { transcribeWav, provider } from './transcribe.js';
 import { draftDescription, describeProvider } from './describe.js';
 import { normalizeCuts, isWordCut, withTrim } from '../public/timeline.js';
 import { buildSidx, spliceRanges } from './mp4index.js';
+import { startRedact, redactStep, finishRedact, Unsupported, Timeline, effectiveCuts } from './redact.js';
 
 const PART_SIZE = 5 * 1024 * 1024; // R2 multipart: every part but the last must be this size
 const SESSION_DAYS = 90;
@@ -27,6 +29,9 @@ const MAX_LOGIN_JSON = 4096;
 const MAX_THUMB = 2 * 1024 * 1024;
 const INDEX_TRIES = 3; // fragment-index builds per file before giving up (a build can be killed)
 const INDEX_WAIT_MS = 15000; // how long "complete" waits for the fragment index before answering
+const REDACT_TRIES = 5; // failed (not unsupported) builds of a viewers' copy before giving up
+const REDACT_LEASE_MS = 60e3; // a build that saved nothing for this long is taken over
+const REDACT_STEP_MS = 20000; // per request (a request's background work gets 30 s)
 const ID_ALPHABET = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const ALLOWED_MIME = /^video\/(webm|mp4|x-matroska|quicktime)(;.*)?$/i;
 const ID = '([A-Za-z0-9]{6,32})';
@@ -54,7 +59,7 @@ export default {
   // Hourly (wrangler.toml [triggers]): delete videos past their expiry, then index a few files
   // that have no fragment index yet (older recordings; builds cut short).
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(sweepExpired(env).then(() => indexBacklog(env)));
+    ctx.waitUntil(sweepExpired(env).then(() => redactBacklog(env)).then(() => indexBacklog(env)));
   },
 };
 
@@ -90,7 +95,7 @@ async function route(request, env, ctx) {
   if (path === '/oembed' && method === 'GET') return oembed(env, url);
   if (match(new RegExp(`^/raw/${ID}(?:/(cam))?(?:\\.\\w+)?$`)) && (method === 'GET' || method === 'HEAD')) return rawVideo(request, env, ctx, m[1], m[2] || 'main', url);
   if (match(new RegExp(`^/thumb/${ID}(?:/(cam|og))?(?:\\.jpg)?$`)) && method === 'GET') return thumb(request, env, m[1], m[2] || 'poster');
-  if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(env, m[1]);
+  if (match(new RegExp(`^/api/videos/${ID}/status$`)) && method === 'GET') return status(request, env, m[1]);
   if (match(new RegExp(`^/api/videos/${ID}/view$`)) && method === 'POST') return countView(request, env, m[1], url);
   if (match(new RegExp(`^/api/videos/${ID}/transcript$`)) && method === 'GET') return getTranscript(request, env, m[1]);
 
@@ -104,12 +109,13 @@ async function route(request, env, ctx) {
   if (path === '/api/videos' && method === 'POST') return createVideo(request, env, url);
   if (match(new RegExp(`^/api/videos/${ID}$`))) {
     if (method === 'GET') return json(publicVideo(await getVideo(env, m[1]), url, true));
-    if (method === 'PATCH') return patchVideo(request, env, m[1], url);
+    if (method === 'PATCH') return patchVideo(request, env, ctx, m[1], url);
     if (method === 'DELETE') return deleteVideo(env, m[1]);
   }
   if (match(new RegExp(`^/api/videos/${ID}/parts/(\\d{1,5})$`)) && method === 'PUT') return uploadPart(request, env, m[1], Number(m[2]), url.searchParams.get('track') || 'main');
   if (match(new RegExp(`^/api/videos/${ID}/complete$`)) && method === 'POST') return completeVideo(request, env, ctx, m[1], url);
   if (match(new RegExp(`^/api/videos/${ID}/describe$`)) && method === 'POST') return describeNow(env, m[1], url);
+  if (match(new RegExp(`^/api/videos/${ID}/redact$`)) && method === 'POST') return redactNow(request, env, m[1]);
   if (match(new RegExp(`^/api/videos/${ID}/thumb$`)) && method === 'PUT') return putThumb(request, env, m[1], url.searchParams.get('variant') || 'poster');
   if (match(new RegExp(`^/api/videos/${ID}/audio/(\\d{1,5})$`)) && method === 'PUT') return putAudio(request, env, ctx, m[1], Number(m[2]));
   if (match(new RegExp(`^/api/videos/${ID}/transcript/retry$`)) && method === 'POST') return retryTranscript(env, m[1]);
@@ -353,10 +359,11 @@ async function putThumb(request, env, id, variant) {
   return json({ ok: true });
 }
 
-async function patchVideo(request, env, id, url) {
+async function patchVideo(request, env, ctx, id, url) {
   const body = await readJson(request);
   const v = await getVideo(env, id);
   const sets = [], args = [];
+  const next = { ...v }; // the row with the new edits
   if (body.title !== undefined) {
     const t = cleanTitle(body.title);
     if (!t) throw new HttpError(400, 'Title can’t be empty');
@@ -381,16 +388,26 @@ async function patchVideo(request, env, id, url) {
   if (body.cuts !== undefined) {
     if (!Array.isArray(body.cuts) || body.cuts.length > 5000) throw new HttpError(400, 'Bad cuts');
     const dur = v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7;
-    sets.push('cuts = ?'); args.push(JSON.stringify(normalizeCuts(body.cuts, dur)));
+    next.cuts = JSON.stringify(normalizeCuts(body.cuts, dur));
+    sets.push('cuts = ?'); args.push(next.cuts);
   }
   if (body.trim !== undefined) {
     const t = cleanTrim(body.trim, v.duration_ms ? v.duration_ms / 1000 + 5 : 1e7);
+    next.trim_start = t.start; next.trim_end = t.end;
     sets.push('trim_start = ?', 'trim_end = ?'); args.push(t.start, t.end);
+  }
+  // New edits: the viewers' copy is rebuilt, and written in the same statement as the edits, so
+  // there is never a moment when viewers could be served a copy made for older ones.
+  let rebuild = false;
+  if (body.cuts !== undefined || body.trim !== undefined) {
+    const r = await redactFor(next, parseJson(v.redact, null));
+    if (r !== undefined) { sets.push('redact = ?'); args.push(r === null ? null : JSON.stringify(r)); rebuild = true; }
   }
   if (sets.length) {
     sets.push('updated_at = ?'); args.push(Date.now());
     await env.DB.prepare(`UPDATE videos SET ${sets.join(', ')} WHERE id = ?`).bind(...args, id).run();
   }
+  if (rebuild) ctx.waitUntil(runRedact(env, id, stepMs(env)));
   return json(publicVideo(await getVideo(env, id), url, true));
 }
 
@@ -424,6 +441,7 @@ async function removeVideo(env, v) {
     cursor = page.truncated ? page.cursor : undefined;
   } while (cursor);
   for (let i = 0; i < keys.length; i += 1000) await env.VIDEOS.delete(keys.slice(i, i + 1000));
+  await dropCopies(env, id);
   await env.DB.batch([
     env.DB.prepare('DELETE FROM parts WHERE video_id = ?').bind(id),
     env.DB.prepare('DELETE FROM transcript_chunks WHERE video_id = ?').bind(id),
@@ -436,9 +454,11 @@ async function listVideos(env) {
   return json({ videos: results.map((v) => publicVideo(v, null, true)) });
 }
 
-async function status(env, id) {
-  const v = await env.DB.prepare('SELECT status, expires_at FROM videos WHERE id = ?').bind(id).first();
+async function status(request, env, id) {
+  const v = await env.DB.prepare('SELECT status, expires_at, cuts, trim_start, trim_end, redact FROM videos WHERE id = ?').bind(id).first();
   if (!v || expired(v)) throw new HttpError(404, 'Not found');
+  // A viewer waits while the edited copy is built.
+  if (v.status === 'ready' && viewerCopy(v).kind === 'wait' && !(await isOwner(request, env))) return json({ status: 'updating' });
   return json({ status: v.status });
 }
 
@@ -513,13 +533,19 @@ async function transcriptOf(env, id, expected = -1) {
 }
 
 async function getTranscript(request, env, id) {
-  const v = await env.DB.prepare('SELECT status, cuts, trim_start, trim_end, audio_chunks, expires_at FROM videos WHERE id = ?').bind(id).first();
+  const v = await env.DB.prepare('SELECT status, cuts, trim_start, trim_end, audio_chunks, expires_at, redact FROM videos WHERE id = ?').bind(id).first();
   if (!v || expired(v)) throw new HttpError(404, 'Not found');
   const t = await transcriptOf(env, id, v.status === 'ready' ? v.audio_chunks : -1);
   if (!(await isOwner(request, env))) {
-    // Viewers never get the words that were cut or trimmed.
-    const cuts = playCuts(v);
+    // Viewers never get the words that were cut or trimmed. With the edited copy, the words that
+    // are left are moved onto its clock (it has no gaps to skip).
+    const copy = viewerCopy(v);
+    const cuts = copy.kind === 'copy' ? copy.r.cuts : playCuts(v);
     t.words = t.words.filter((w) => !isWordCut(w, cuts));
+    if (copy.kind === 'copy') {
+      const tl = new Timeline(cuts);
+      t.words = t.words.map((w) => ({ ...w, s: round3(tl.edited(w.s)), e: round3(tl.edited(w.e)) }));
+    }
     delete t.failed;
     delete t.missing;
   }
@@ -640,12 +666,20 @@ async function oembed(env, url) {
 }
 
 async function rawVideo(request, env, ctx, id, track, url) {
-  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at, mp4_index FROM videos WHERE id = ?').bind(id).first();
+  const v = await env.DB.prepare('SELECT status, mime, cam_mime, title, layout, expires_at, mp4_index, cuts, trim_start, trim_end, redact FROM videos WHERE id = ?').bind(id).first();
   if (!v || v.status !== 'ready' || expired(v)) return new Response('Not found', { status: 404 });
   const download = [...url.searchParams.keys()].some((k) => k.toLowerCase() === 'download');
-  if (download && !(await isOwner(request, env))) return new Response('Downloads are for the owner', { status: 403 });
+  const owner = await isOwner(request, env);
+  if (download && !owner) return new Response('Downloads are for the owner', { status: 403 });
   // With the Screen layout the camera isn't part of the video, so viewers can't fetch it.
-  if (track === 'cam' && camHidden(v) && !(await isOwner(request, env))) return new Response('Not found', { status: 404 });
+  if (track === 'cam' && camHidden(v) && !owner) return new Response('Not found', { status: 404 });
+  // Viewers of an edited video get the copy without the edited-out parts, or nothing until it's
+  // built. The owner (and only the owner) gets the recording as stored, with `?viewer` the copy.
+  if (!owner || url.searchParams.has('viewer')) {
+    const copy = viewerCopy(v);
+    if (copy.kind === 'wait') return new Response('This video is being updated', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+    if (copy.kind === 'copy') return copyVideo(request, env, ctx, v, copy.r, track, url, download);
+  }
   const key = videoKey(id, track);
   const head = await env.VIDEOS.head(key);
   if (!head) return new Response('Not found', { status: 404 });
@@ -702,6 +736,41 @@ async function rawVideo(request, env, ctx, id, track, url) {
   headers.set('Content-Length', String(len));
   if (range) headers.set('Content-Range', `bytes ${start}-${end}/${size}`);
   return new Response(body, { status: range ? 206 : 200, headers });
+}
+
+// The edited copy of one track (see runRedact). Its URL names its version (`?r=`): a page that
+// opened on an older version gets a 404 rather than bytes from a different file.
+async function copyVideo(request, env, ctx, v, r, track, url, download) {
+  const out = r.out[track];
+  const wanted = url.searchParams.get('r');
+  if (!out || (wanted && wanted !== r.ver)) return new Response('Not found', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+  const size = out.size;
+  const etag = `"c-${r.ver}-${track}"`;
+  const headers = new Headers({
+    'Content-Type': 'video/mp4',
+    'Accept-Ranges': 'bytes',
+    'ETag': etag,
+    'Cache-Control': download ? 'private, no-store' : track === 'cam' ? 'private, no-cache' : 'public, max-age=300',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  if (download) {
+    const name = (v.title || 'video').replace(/[^\w\- .]+/g, '').trim().slice(0, 80) || 'video';
+    headers.set('Content-Disposition', `attachment; filename="${name}${track === 'cam' ? ' (camera)' : ''} (edited).mp4"`);
+  }
+  const ifRange = request.headers.get('If-Range');
+  const range = ifRange && ifRange !== etag ? null : parseRange(request.headers.get('Range'), size);
+  if (range === 'invalid') {
+    headers.set('Content-Range', `bytes */${size}`);
+    return new Response(null, { status: 416, headers });
+  }
+  if (request.method === 'HEAD') {
+    headers.set('Content-Length', String(size));
+    return new Response(null, { status: 200, headers });
+  }
+  const start = range ? range.start : 0, end = range ? range.end : size - 1;
+  headers.set('Content-Length', String(end - start + 1));
+  if (range) headers.set('Content-Range', `bytes ${start}-${end}/${size}`);
+  return new Response(partsBody(env, ctx, out.parts, start, end), { status: range ? 206 : 200, headers });
 }
 
 // Streams the stored file's byte ranges with the index bytes between them, at a fixed length.
@@ -836,6 +905,241 @@ async function thumb(request, env, id, variant) {
   return new Response(obj.body, { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': variant === 'cam' ? 'private, no-cache' : 'public, max-age=300' } });
 }
 
+// ---------- the viewers' copy (edits taken out of the file) ----------
+//
+// The owner's player plays the recording as stored and skips the edits. Viewers of an edited video
+// get a copy with the edited-out parts removed (redact.js), so the link never hands out what he
+// cut. The copy is built in the background, in steps that save their progress, driven by the edit
+// itself, by the owner's page while it is open and by the hourly job; until it is ready, viewers
+// see "being updated" (never the original). A recording the remuxer can't handle (WebM from
+// Firefox, say) is marked unsupported: viewers then get the stored file with the edits skipped, as
+// before, and the owner is told the shared file still holds them.
+
+async function editSig(cuts, v) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([cuts, v.cam_offset_ms || 0, v.mime, v.cam_mime || ''])));
+  return b64url(new Uint8Array(d)).slice(0, 22);
+}
+
+// The redact column for a row with these edits, given what's stored: undefined = keep it as it is;
+// null = no edits (viewers get the file); else a new pending build.
+async function redactFor(v, cur) {
+  const cuts = playCuts(v);
+  if (!cuts.length) return cur === null ? undefined : null;
+  const sig = await editSig(cuts, v);
+  if (cur && cur.sig === sig && cur.state !== 'failed') return undefined;
+  const mp4 = (m) => !m || /mp4/i.test(m);
+  if (!mp4(v.mime) || (v.cam_mime && !mp4(v.cam_mime))) return { sig, state: 'unsupported', error: 'not MP4' };
+  return { sig, state: 'pending', ver: newId(10), tries: 0, since: 0, job: null };
+}
+
+// What a viewer gets: { kind: 'file' } (no edits, or a recording that can't be redacted),
+// { kind: 'copy', r } (the redacted copy, ready) or { kind: 'wait' } (being built).
+function viewerCopy(v) {
+  if (!playCuts(v).length) return { kind: 'file' };
+  const r = parseJson(v.redact, null);
+  if (r && r.state === 'unsupported') return { kind: 'file' };
+  if (r && r.state === 'ready' && r.out && r.out.main) return { kind: 'copy', r };
+  return { kind: 'wait' };
+}
+
+const redactPrefix = (id) => `redacted/${id}/`;
+// REDACT_STEP_MS: tests only, to make a build take many steps.
+const stepMs = (env) => Number(env.REDACT_STEP_MS) || REDACT_STEP_MS;
+
+// Deletes a video's copies other than version `keep` (all of them when keep is null).
+async function dropCopies(env, id, keep = null) {
+  let cursor;
+  do {
+    const page = await env.VIDEOS.list({ prefix: redactPrefix(id), cursor });
+    const keys = page.objects.map((o) => o.key).filter((k) => !keep || !k.startsWith(`${redactPrefix(id)}${keep}/`));
+    for (let i = 0; i < keys.length; i += 1000) await env.VIDEOS.delete(keys.slice(i, i + 1000));
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+}
+
+// Writes the redact column if it still holds `expect` (the exact text read), so a build never
+// overwrites newer edits or another build's progress. Returns whether it wrote.
+async function swapRedact(env, id, expect, next) {
+  const r = await env.DB.prepare('UPDATE videos SET redact = ? WHERE id = ? AND redact IS ?')
+    .bind(next === null ? null : JSON.stringify(next), id, expect).run();
+  return !!(r.meta && r.meta.changes);
+}
+
+// Works on a video's copy for up to `budgetMs`. Returns the state it left it in.
+async function runRedact(env, id, budgetMs) {
+  const t0 = Date.now();
+  let row = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
+  if (!row) return null;
+  let r = parseJson(row.redact, null);
+  if (!r) { await dropCopies(env, id).catch((e) => console.error('redact cleanup', id, e && e.message)); return null; }
+  if (r.state !== 'pending') return r.state;
+  if (r.since && Date.now() - r.since < REDACT_LEASE_MS && r.claim) return 'pending'; // someone is on it
+  if (r.tries >= REDACT_TRIES) {
+    await swapRedact(env, id, row.redact, { ...r, state: 'failed' });
+    return 'failed';
+  }
+  // Claimed by writing a fresh lease over exactly what was read.
+  let text = row.redact;
+  const claim = crypto.randomUUID();
+  // A claim left behind (its holder was killed mid-step) counts as a failed try.
+  r = { ...r, claim, since: Date.now(), tries: (r.tries || 0) + (r.claim ? 1 : 0) };
+  if (!(await swapRedact(env, id, text, r))) return 'pending';
+  text = JSON.stringify(r);
+  const save = async (next) => {
+    const ok = await swapRedact(env, id, text, next);
+    if (ok) text = next === null ? null : JSON.stringify(next);
+    return ok;
+  };
+  const cuts = playCuts(row);
+  const job = r.job || { track: 'main' };
+  try {
+    while (job.track) {
+      const track = job.track;
+      const key = videoKey(id, track);
+      const head = await env.VIDEOS.head(key);
+      if (!head) {
+        if (track === 'main') throw new Error('the recording is missing');
+        job.track = null; // no camera file: nothing to copy
+        break;
+      }
+      const read = async (offset, length) => {
+        const obj = await env.VIDEOS.get(key, { range: { offset, length } });
+        if (!obj) throw new Error('range read failed');
+        return new Uint8Array(await obj.arrayBuffer());
+      };
+      let st = job[track] || await startRedact(read, head.size);
+      if (!st.done) {
+        st = await redactStep(read, head.size, st, {
+          // The camera follows the screen's copy, including where its start moved to (main first).
+          cuts: track === 'cam' ? effectiveCuts(cuts, job.main.extra) : cuts,
+          offset: track === 'cam' ? (row.cam_offset_ms || 0) / 1000 : 0, primary: track === 'main',
+          budgetMs: Math.max(0, budgetMs - (Date.now() - t0)),
+          writeSegment: async (bytes) => {
+            const k = `${redactPrefix(id)}${r.ver}/${track}/${String(st.segments.length + 1).padStart(5, '0')}`;
+            await env.VIDEOS.put(k, bytes, { httpMetadata: { contentType: 'video/mp4' } });
+            return { key: k, size: bytes.length };
+          },
+        });
+      }
+      job[track] = st;
+      if (st.done) {
+        const hk = `${redactPrefix(id)}${r.ver}/${track}/head`;
+        const hb = await finishRedact(read, st);
+        await env.VIDEOS.put(hk, hb, { httpMetadata: { contentType: 'video/mp4' } });
+        const parts = [{ key: hk, size: hb.length }, ...st.segments];
+        job.out = { ...(job.out || {}), [track]: { parts, size: parts.reduce((a, p) => a + p.size, 0) } };
+        if (track === 'main') job.main = { extra: st.extra, maxEnd: st.maxEnd };
+        else job.cam = { done: true };
+        job.track = track === 'main' && row.cam_mime ? 'cam' : null;
+      }
+      const out = job.track && Date.now() - t0 >= budgetMs; // out of time: hand it on
+      r = out ? { ...r, job, claim: null, since: 0 } : { ...r, job, since: Date.now() };
+      if (!(await save(r))) return 'pending'; // the edits changed under us: the new build takes over
+      if (out) return 'pending';
+    }
+    const done = {
+      sig: r.sig, state: 'ready', ver: r.ver, out: job.out,
+      cuts: effectiveCuts(cuts, job.main.extra), durationMs: Math.round(job.main.maxEnd * 1000),
+    };
+    if (!(await save(done))) return 'pending';
+    await dropCopies(env, id, r.ver).catch((e) => console.error('redact cleanup', id, e && e.message));
+    return 'ready';
+  } catch (e) {
+    if (e instanceof Unsupported) {
+      console.log(`redact ${id}: unsupported (${e.message})`);
+      await save({ sig: r.sig, state: 'unsupported', error: e.message });
+      await dropCopies(env, id).catch(() => {});
+      return 'unsupported';
+    }
+    console.error(`redact ${id}:`, e && e.message);
+    // Released for the next try (a step that wrote segments keeps them: the job resumes after them).
+    await save({ ...r, job, claim: null, since: 0, tries: (r.tries || 0) + 1, error: String(e && e.message || e).slice(0, 200) });
+    return 'pending';
+  }
+}
+
+// The owner's page, while the copy is being built: a step now (and a fresh start after "failed").
+async function redactNow(request, env, id) {
+  const body = await readJson(request).catch(() => ({}));
+  const v = await getVideo(env, id);
+  const r = parseJson(v.redact, null);
+  if (r && r.state === 'failed' && body && body.retry) {
+    await swapRedact(env, id, v.redact, { sig: r.sig, state: 'pending', ver: newId(10), tries: 0, since: 0, job: null });
+  }
+  const state = await runRedact(env, id, stepMs(env));
+  return json({ shared: sharedState(await getVideo(env, id)), state });
+}
+
+// The hourly job: builds that are waiting (or were cut short), and edited videos from before
+// viewers' copies existed. Bounded so it ends well inside the cron's time.
+async function redactBacklog(env, budgetMs = 8 * 60e3) {
+  const t0 = Date.now();
+  try {
+    const { results } = await env.DB.prepare(
+      `SELECT id FROM videos WHERE status = 'ready' AND (expires_at IS NULL OR expires_at > ?)
+         AND ((redact IS NULL AND (cuts != '[]' OR trim_start IS NOT NULL OR trim_end IS NOT NULL))
+           OR json_extract(redact, '$.state') = 'pending')
+       ORDER BY updated_at DESC LIMIT 50`
+    ).bind(Date.now()).all();
+    for (const { id } of results) {
+      if (Date.now() - t0 > budgetMs) return;
+      const v = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(id).first();
+      if (!v) continue;
+      if (!v.redact) {
+        const r = await redactFor(v, null);
+        if (r === undefined) continue;
+        await swapRedact(env, id, null, r);
+      }
+      // Each video until done (or the budget runs out), a step at a time.
+      for (let i = 0; i < 100 && Date.now() - t0 < budgetMs; i++) {
+        if ((await runRedact(env, id, Math.min(60e3, budgetMs - (Date.now() - t0)))) !== 'pending') break;
+        const now = await env.DB.prepare('SELECT redact FROM videos WHERE id = ?').bind(id).first();
+        const r = parseJson(now && now.redact, null);
+        if (!r || r.state !== 'pending' || r.claim) break; // someone else has it, or it gave up for now
+      }
+    }
+  } catch (e) { console.error('redact backlog', e && e.message); }
+}
+
+// For the owner: what viewers get. none (no edits) | pending | ready | unsupported | failed.
+function sharedState(v) {
+  if (!playCuts(v).length) return 'none';
+  const r = parseJson(v.redact, null);
+  return r ? r.state : 'pending';
+}
+
+// Streams the copy's parts (head + segments, one file end to end) for bytes start..end.
+function partsBody(env, ctx, parts, start, end) {
+  const pieces = [];
+  let at = 0;
+  for (const p of parts) {
+    const s = Math.max(start, at), e = Math.min(end, at + p.size - 1);
+    if (s <= e) pieces.push({ key: p.key, offset: s - at, length: e - s + 1 });
+    at += p.size;
+  }
+  let i = 0, reader = null;
+  const source = new ReadableStream({
+    async pull(ctrl) {
+      for (;;) {
+        if (reader) {
+          const { done, value } = await reader.read();
+          if (!done) { ctrl.enqueue(value); return; }
+          reader = null;
+        }
+        if (i >= pieces.length) { ctrl.close(); return; }
+        const p = pieces[i++];
+        const obj = await env.VIDEOS.get(p.key, { range: { offset: p.offset, length: p.length } });
+        if (!obj) { ctrl.error(new Error('Video data is missing')); return; }
+        reader = obj.body.getReader();
+      }
+    },
+    cancel(reason) { if (reader) reader.cancel(reason).catch(() => {}); },
+  });
+  const fixed = new FixedLengthStream(end - start + 1);
+  ctx.waitUntil(source.pipeTo(fixed.writable).catch(() => {}));
+  return fixed.readable;
+}
+
 // ---------- helpers ----------
 
 export function parseRange(header, size) {
@@ -889,12 +1193,22 @@ function publicVideo(v, url, owner = false) {
     out.ix = { main: idx.main && idx.main.sidx ? 1 : 0, cam: idx.cam && idx.cam.sidx ? 1 : 0 };
   }
   if (!owner && v.cam_mime && camHidden(v)) Object.assign(out, { hasCam: false, hasCamThumb: false, camMime: null });
+  if (!owner && v.redact !== undefined && v.status === 'ready') {
+    // Viewers of an edited video: the copy has no gaps, so nothing to skip, and its own length.
+    const copy = viewerCopy(v);
+    if (copy.kind === 'wait') out.status = 'updating';
+    if (copy.kind === 'copy') {
+      Object.assign(out, { cuts: [], trim: null, durationMs: copy.r.durationMs, copy: copy.r.ver, camMime: out.camMime && 'video/mp4', mime: 'video/mp4' });
+      delete out.ix;
+    }
+  }
   if (owner) {
     Object.assign(out, {
       size: v.size, camSize: v.cam_size || 0, views: v.views, updatedAt: v.updated_at,
       surface: v.surface || '', camMutedMs: v.cam_muted_ms || 0, tapGapMs: v.tap_gap_ms || 0,
       expiresAt: v.expires_at || null, descriptionSource: v.description_source || '',
     });
+    if (v.redact !== undefined) out.shared = sharedState(v);
   }
   if (url) out.shareUrl = `${url.origin}/v/${v.id}`;
   return out;

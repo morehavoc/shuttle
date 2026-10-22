@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "wrangler d1 migrations apply shuttle --local --env local && wrangler dev --env local",
     "migrate:local": "wrangler d1 migrations apply shuttle --local --env local",
-    "test": "node test/timeline.test.mjs && node test/transcribe.test.mjs && node test/mp4index.test.mjs && node test/api.test.mjs",
+    "test": "node test/timeline.test.mjs && node test/transcribe.test.mjs && node test/mp4index.test.mjs && node test/redact.test.mjs && node test/api.test.mjs",
     "test:e2e": "node test/e2e.mjs"
   },
   "devDependencies": {
