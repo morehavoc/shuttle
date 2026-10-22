@@ -174,7 +174,7 @@ for (const engine of ['webkit', 'chromium']) {
     // ---- a viewer who arrives while the copy is being made ----
     if (engine === 'chromium') {
       const r = redactRow(id);
-      d1(`UPDATE videos SET redact = '${JSON.stringify({ sig: r.sig + 'z', state: 'pending', ver: 'waitver', tries: 0, since: 0, claim: null, job: null })}' WHERE id = '${id}'`);
+      d1(`UPDATE videos SET redact = '${JSON.stringify({ sig: r.sig, state: 'pending', ver: 'waitver', tries: 0, since: 0, claim: null, job: null }).replace(/'/g, "''")}' WHERE id = '${id}'`);
       const wctx = await browser.newContext({ ignoreHTTPSErrors: true });
       const wp = await wctx.newPage();
       await wp.goto(`${BASE}/v/${id}`);

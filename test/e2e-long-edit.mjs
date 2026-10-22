@@ -48,8 +48,9 @@ const t0 = Date.now();
 let shared = (await (await call(`/api/videos/${v.id}`, { method: 'PATCH', ...json({ cuts: CUTS, trim: TRIM }) })).json()).shared;
 let steps = 0, leaked = 0;
 while (shared === 'pending' && steps < 500) {
+  // A viewer gets "being updated", or the copy once it's done; never the stored file.
   const raw = await call(`/raw/${v.id}`, { headers: { Cookie: '' }, method: 'HEAD' });
-  if (raw.status !== 404) leaked++;
+  if (raw.status !== 404 && !/^"c-/.test(raw.headers.get('etag') || '')) leaked++;
   shared = (await (await call(`/api/videos/${v.id}/redact`, { method: 'POST', ...json({}) })).json()).shared;
   steps++;
 }
@@ -67,6 +68,18 @@ check(Math.abs(dur - want) < 1.1, `the copy is ${dur.toFixed(1)} s (edited lengt
 let errs = '';
 try { execFileSync('ffmpeg', ['-v', 'error', '-xerror', '-i', out, '-f', 'null', '-'], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch (e) { errs = String(e.stderr || e.message); }
 check(!errs, 'the copy decodes with no errors', errs.slice(0, 300));
+// Byte for byte what one uninterrupted build makes: however many steps it took, and whatever
+// failed on the way (run with REDACT_FAIL_PUT to make a segment write fail mid-build).
+{
+  const { startRedact, redactStep, finishRedact } = await import('../src/redact.js');
+  const { withTrim } = await import('../public/timeline.js');
+  const read = async (o, l) => new Uint8Array(bytes.buffer, bytes.byteOffset + o, Math.min(l, bytes.length - o));
+  let st = await startRedact(read, bytes.length);
+  const segs = [];
+  st = await redactStep(read, bytes.length, st, { cuts: withTrim(CUTS, TRIM), budgetMs: 1e9, writeSegment: async (c, size) => { segs.push(Buffer.concat(c)); return { key: '', size }; } });
+  const want = Buffer.concat([Buffer.from(await finishRedact(read, st)), ...segs]);
+  check(want.equals(readFileSync(out)), `the copy is byte for byte one clean build (${process.env.REDACT_FAIL_PUT ? 'a segment write failed on the way' : 'no failure injected'})`);
+}
 
 const pv = await (await call(`/api/videos/${v.id}`)).json();
 for (const engine of ['webkit', 'chromium']) {

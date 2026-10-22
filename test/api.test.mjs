@@ -737,11 +737,13 @@ try {
 
   await test('edited video: a build that keeps failing stops, and the owner can start it again', async () => {
     const red = JSON.parse(JSON.parse(d1(`SELECT redact FROM videos WHERE id = '${rid}'`))[0].results[0].redact);
-    const dead = JSON.stringify({ sig: red.sig + 'y', state: 'pending', ver: 'deadver', tries: 5, since: 0, claim: null, job: null });
+    const dead = JSON.stringify({ sig: red.sig, state: 'pending', ver: 'deadver', tries: 5, since: 0, claim: null, job: null });
     d1(`UPDATE videos SET redact = '${dead}' WHERE id = '${rid}'`);
     let r = await j(await call(`/api/videos/${rid}/redact`, { method: 'POST', body: {} }));
     assert.equal(r.shared, 'failed');
     assert.equal((await call(`/raw/${rid}`, { anon: true })).status, 404, 'still never the stored file');
+    assert.deepEqual(await j(await call(`/api/videos/${rid}/status`, { anon: true })), { status: 'unavailable' });
+    assert.match(await (await call(`/v/${rid}`, { anon: true })).text(), /isn’t available right now/);
     assert.equal((await call(`/api/videos/${rid}/redact`, { method: 'POST', anon: true, body: {} })).status, 401);
     r = await j(await call(`/api/videos/${rid}/redact`, { method: 'POST', body: { retry: true } }));
     assert.equal(r.shared, 'ready');
@@ -750,7 +752,7 @@ try {
 
   await test('edited video: a build whose step was killed is taken over after its lease', async () => {
     const red = JSON.parse(JSON.parse(d1(`SELECT redact FROM videos WHERE id = '${rid}'`))[0].results[0].redact);
-    const sig = red.sig.split('').reverse().join(''); // any other edit
+    const sig = red.sig;
     const live = JSON.stringify({ sig, state: 'pending', ver: 'livever', tries: 0, since: Date.now(), claim: 'alive', job: null });
     d1(`UPDATE videos SET redact = '${live}' WHERE id = '${rid}'`);
     let r = await j(await call(`/api/videos/${rid}/redact`, { method: 'POST', body: {} }));
@@ -760,6 +762,58 @@ try {
     r = await j(await call(`/api/videos/${rid}/redact`, { method: 'POST', body: {} }));
     assert.equal(r.shared, 'ready', 'an expired one is taken over');
     await viewerUntilReady(rid, readFileSync(mainFile));
+  });
+
+  await test('edited video: the owner\'s stored file is never publicly cacheable; the copy\'s URL is the copy for everyone', async () => {
+    const pv = await viewerJson(rid);
+    let r = await call(`/raw/${rid}`);
+    assert.equal(r.headers.get('cache-control'), 'private, no-store');
+    assert.match(r.headers.get('vary') || '', /Cookie/);
+    assert.doesNotMatch(r.headers.get('etag'), /^"c-/, 'the owner gets the stored file');
+    await r.arrayBuffer();
+    r = await call(`/raw/${rid}?r=${pv.copy}`);
+    assert.match(r.headers.get('etag'), /^"c-/, 'at ?r= the owner gets the copy too');
+    await r.arrayBuffer();
+    // The owner's own embed: copy data, copy bytes.
+    const embed = await (await call(`/e/${rid}`)).text();
+    assert.match(embed, new RegExp(`"copy":"${pv.copy}"`));
+  });
+
+  await test('edited video: a damaged recording fails closed — viewers get nothing, not the file', async () => {
+    const good = readFileSync(mainFile);
+    const bad = Buffer.from(good);
+    // The third fragment claims more samples than its table holds: a file of the right kind that
+    // doesn't hold together.
+    let o = 0, moofs = 0;
+    while (o + 8 <= bad.length) {
+      const sz = bad.readUInt32BE(o), ty = bad.toString('latin1', o + 4, o + 8);
+      if (ty === 'moof' && ++moofs === 3) { const t = bad.indexOf(Buffer.from('trun'), o); bad.writeUInt32BE(0x00ffffff, t + 8); break; }
+      o += sz;
+    }
+    const f = writeTmp('api-damaged.mp4', bad);
+    const did = await upload(f, { durationMs: 11000 });
+    let v = await j(await call(`/api/videos/${did}`, { method: 'PATCH', body: { cuts: CUTS } }));
+    for (let i = 0; i < 100 && v.shared === 'pending'; i++) { await new Promise((res) => setTimeout(res, 100)); v = await j(await call(`/api/videos/${did}`)); }
+    assert.equal(v.shared, 'failed');
+    assert.equal((await call(`/raw/${did}`, { anon: true })).status, 404);
+    assert.deepEqual(await j(await call(`/api/videos/${did}/status`, { anon: true })), { status: 'unavailable' });
+    const red = JSON.parse(JSON.parse(d1(`SELECT redact FROM videos WHERE id = '${did}'`))[0].results[0].redact);
+    assert.equal(red.permanent, true);
+    // Removing the edits gives viewers the file again (there is nothing in it he took out).
+    v = await j(await call(`/api/videos/${did}`, { method: 'PATCH', body: { cuts: [] } }));
+    assert.equal(v.shared, 'none');
+    assert.equal((await call(`/raw/${did}`, { anon: true, method: 'HEAD' })).status, 200);
+    await call(`/api/videos/${did}`, { method: 'DELETE' });
+  });
+
+  await test('edited video: a copy made for other edits is never served', async () => {
+    const red = JSON.parse(JSON.parse(d1(`SELECT redact FROM videos WHERE id = '${rid}'`))[0].results[0].redact);
+    const stale = JSON.stringify({ ...red, sig: red.sig.replace('5', '4') });
+    d1(`UPDATE videos SET redact = '${stale.replace(/'/g, "''")}' WHERE id = '${rid}'`);
+    assert.equal((await call(`/raw/${rid}`, { anon: true })).status, 404);
+    assert.equal((await call(`/raw/${rid}?r=${red.ver}`, { anon: true })).status, 404);
+    d1(`UPDATE videos SET redact = '${JSON.stringify(red).replace(/'/g, "''")}' WHERE id = '${rid}'`);
+    assert.equal((await call(`/raw/${rid}`, { anon: true, method: 'HEAD' })).status, 200);
   });
 
   await test('edited video: deleting it deletes its copies', async () => {

@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { startRedact, redactStep, finishRedact, Unsupported, Timeline, effectiveCuts } from '../src/redact.js';
+import { startRedact, redactStep, finishRedact, Unsupported, Malformed, Timeline, effectiveCuts } from '../src/redact.js';
 import { dir, FPS, SECRET, PITCHES, ff, fixture, frames, tones, srcOf, seams } from './media-fixtures.mjs';
 
 let n = 0, failed = 0;
@@ -23,7 +23,7 @@ async function redact(file, cuts, { offset = 0, primary = true, budgetMs = 20000
   let st = JSON.parse(JSON.stringify(await startRedact(read, buf.length)));
   let steps = 0;
   while (!st.done) {
-    st = await redactStep(read, buf.length, st, { cuts, offset, primary, budgetMs, writeSegment: async (b) => { segs.push(b); return { key: `s${segs.length}`, size: b.length }; } });
+    st = await redactStep(read, buf.length, st, { cuts, offset, primary, budgetMs, writeSegment: async (chunks, size) => { const b = Buffer.concat(chunks); assert.equal(b.length, size); segs.push(b); return { key: `s${segs.length}`, size }; } });
     st = JSON.parse(JSON.stringify(st));
     if (++steps > 10000) throw new Error('no progress');
   }
@@ -256,15 +256,51 @@ await t('plain (not fragmented) MP4: refused', async () => {
   await assert.rejects(redact(f, [[0.5, 1]]), Unsupported);
 });
 
-await t('garbage after the header: refused or stopped, never a throw of another kind', async () => {
+// Where the first fragment ends: damage after it can never make the file look like a kind this
+// doesn't handle (which would hand viewers the stored file).
+const firstFragEnd = (() => {
+  const b = fs.readFileSync(main);
+  let o = 0, moofs = 0;
+  while (o + 8 <= b.length) { const sz = b.readUInt32BE(o), ty = b.toString('latin1', o + 4, o + 8); o += sz; if (ty === 'mdat' && ++moofs === 1) return o; }
+  return 0;
+})();
+
+await t('damage after the first fragment: Malformed (viewers wait), never Unsupported, never another error', async () => {
   const buf = fs.readFileSync(main);
-  for (let i = 0; i < 40; i++) {
+  const seen = { malformed: 0, clean: 0 };
+  for (let i = 0; i < 60; i++) {
     const b = Buffer.from(buf);
-    const at = 2000 + Math.floor(Math.random() * (b.length - 2000));
+    const at = firstFragEnd + Math.floor(Math.random() * (b.length - firstFragEnd - 16));
     for (let k = 0; k < 16; k++) b[at + k] = Math.floor(Math.random() * 256);
     const f = path.join(dir, `bad${i}.mp4`);
     fs.writeFileSync(f, b);
-    try { await redact(f, CUTS); } catch (e) { if (!(e instanceof Unsupported)) throw e; }
+    try { await redact(f, CUTS); seen.clean++; } catch (e) {
+      if (!(e instanceof Malformed)) throw new Error(`at ${at}: ${e.constructor.name}: ${e.message}`);
+      seen.malformed++;
+    }
+  }
+  assert.ok(seen.malformed + seen.clean === 60);
+});
+
+await t('a box header that turns a later fragment into "absolute offsets": Malformed, not Unsupported', async () => {
+  const b = Buffer.from(fs.readFileSync(main));
+  const i = b.indexOf(Buffer.from('tfhd'), firstFragEnd);
+  b[i + 7] |= 0x01; // base-data-offset-present
+  const f = path.join(dir, 'abs-later.mp4');
+  fs.writeFileSync(f, b);
+  await assert.rejects(redact(f, CUTS), Malformed);
+});
+
+await t('a recording cut off anywhere in its last fragment just ends there', async () => {
+  const buf = fs.readFileSync(main);
+  // The last moof's start, then every cut-off point from inside it to 40 bytes into its mdat.
+  const last = buf.lastIndexOf(Buffer.from('moof')) - 4;
+  const moofSize = buf.readUInt32BE(last);
+  for (let cut = last + 1; cut <= last + moofSize + 40; cut += 3) {
+    const f = path.join(dir, 'trunc.mp4');
+    fs.writeFileSync(f, buf.subarray(0, cut));
+    const x = await redact(f, CUTS);
+    assert.ok(x.state.done);
   }
 });
 

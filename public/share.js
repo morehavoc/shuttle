@@ -392,22 +392,29 @@ function sharedRow() {
       pending: 'Removing your edits from the shared file…',
       ready: 'Viewers get a copy with your trims and cuts removed.',
       unsupported: 'This recording can’t be cut on the server: the shared file still has the trimmed and cut parts.',
-      failed: 'Couldn’t remove your edits from the shared file. Viewers see “updating” for now.',
+      failed: 'Couldn’t remove your edits from the shared file, so viewers can’t watch it.',
     }[state] || '';
     note.replaceChildren(...(state === 'pending' ? [h('span', { class: 'spin-sm' })] : []), text, ...(state === 'failed' ? [' ', retry] : []));
     if (state === 'pending') drive(false);
   };
+  // Each call runs a step of the build on the server; between calls, a pause. The server keeps
+  // going on its own (every few minutes), so this page only speeds it up: on an error it backs
+  // off, and it stops for good on one that won't change (signed out, video gone).
+  let failures = 0;
   async function drive(again) {
     if (busy) return;
     busy = true;
-    try {
-      for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 200; i++) {
+      try {
         const r = await api(`/api/videos/${v.id}/redact`, { method: 'POST', body: again && i === 0 ? { retry: true } : {} });
+        failures = 0;
         v.shared = r.shared;
         if (r.shared !== 'pending') break;
-        await new Promise((res) => setTimeout(res, 1500));
+      } catch (e) {
+        if (e.status === 401 || e.status === 404 || ++failures >= 5) { busy = false; return; }
       }
-    } catch {} // the server keeps going on its own; this page only speeds it up
+      await new Promise((res) => setTimeout(res, failures ? 5000 * failures : 1500));
+    }
     busy = false;
     sharedSync(v.shared);
   }
@@ -744,6 +751,7 @@ if (v.status === 'ready') {
   const started = Date.now();
   const updating = v.status === 'updating';
   const poll = async () => {
+    if (v.status === 'unavailable') return; // nothing to wait for
     if (Date.now() - started > (updating ? 60 : 15) * 60e3) {
       $('#pending').innerHTML = updating ? '<p>This video is still being updated. Try again later.</p>' : '<p>This recording didn’t finish.</p>';
       return;

@@ -16,17 +16,22 @@
 //
 // The work is resumable: a step reads fragments in order and writes the output as a run of
 // segments (whole fragments each), and its state is plain JSON, so a step the runtime cuts short
-// is picked up from the last saved state. A file this can't redact (not fragmented MP4, sample
-// data outside its fragment, B-frames, absolute offsets) throws Unsupported.
+// is picked up from the last saved state. A kind of file this can't redact (not fragmented MP4,
+// B-frames, absolute offsets) throws Unsupported; one that is damaged throws Malformed.
 
 import { boxAt, boxesIn, sidxBox } from './mp4index.js';
 
 export const SEG_BYTES = 8 * 1024 * 1024; // output segment size to aim for
 const READ_WINDOW = 4 * 1024 * 1024;
-const MAX_FRAGMENT = 64 * 1024 * 1024; // one moof + mdat; a recorder's are a few MB at most
+const MAX_FRAGMENT = 24 * 1024 * 1024; // one moof + mdat; a recorder's are a few MB at most (a Worker has 128 MB)
 const MAX_MOOV = 8 * 1024 * 1024;
 
+// A kind of file this can't redact (WebM, plain MP4, B-frames…): the owner is told, and viewers
+// get the file as stored, edits skipped at playback, as before there were copies.
 export class Unsupported extends Error {}
+// A file of the kind this handles that doesn't hold together. Never a reason to hand out the
+// stored file: the copy fails, and viewers wait.
+export class Malformed extends Error {}
 
 const typeOf = (b, o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
 const child = (b, box, type) => boxesIn(b, box.start + box.hdr, box.start + box.size).find((x) => x.type === type);
@@ -99,18 +104,18 @@ function readMoov(b, moov) {
   for (const trak of children(b, moov, 'trak')) {
     const tkhd = child(b, trak, 'tkhd'), mdia = child(b, trak, 'mdia');
     const mdhd = mdia && child(b, mdia, 'mdhd'), hdlr = mdia && child(b, mdia, 'hdlr');
-    if (!tkhd || !mdhd || !hdlr || hdlr.size < hdlr.hdr + 12) throw new Unsupported('track header');
+    if (!tkhd || !mdhd || !hdlr || hdlr.size < hdlr.hdr + 12) throw new Malformed('track header');
     const tv = b[tkhd.start + tkhd.hdr], mv = b[mdhd.start + mdhd.hdr];
-    if (tkhd.size < tkhd.hdr + (tv === 1 ? 24 : 16) || mdhd.size < mdhd.hdr + (mv === 1 ? 24 : 16)) throw new Unsupported('track header');
+    if (tkhd.size < tkhd.hdr + (tv === 1 ? 24 : 16) || mdhd.size < mdhd.hdr + (mv === 1 ? 24 : 16)) throw new Malformed('track header');
     const id = dv.getUint32(tkhd.start + tkhd.hdr + (tv === 1 ? 20 : 12));
     const ts = dv.getUint32(mdhd.start + mdhd.hdr + (mv === 1 ? 20 : 12));
     const handler = typeOf(b, hdlr.start + hdlr.hdr + 8);
-    if (!ts) throw new Unsupported('track timescale');
+    if (!ts) throw new Malformed('track timescale');
     if (handler !== 'vide' && handler !== 'soun') throw new Unsupported(`a ${handler} track`);
     tracks[id] = { ts, kind: handler === 'vide' ? 'video' : 'audio', trex: trex[id] || { sdi: 1, dur: 0, size: 0, flags: 0 } };
   }
   const ids = Object.keys(tracks);
-  if (!ids.length) throw new Unsupported('no tracks');
+  if (!ids.length) throw new Malformed('no tracks');
   if (ids.filter((id) => tracks[id].kind === 'video').length > 1) throw new Unsupported('more than one video track');
   return tracks;
 }
@@ -122,30 +127,30 @@ function readMoof(b, moof, tracks, limit) {
   const out = [];
   for (const traf of children(b, moof, 'traf')) {
     const tfhd = child(b, traf, 'tfhd'), tfdt = child(b, traf, 'tfdt');
-    if (!tfhd || tfhd.size < tfhd.hdr + 8) throw new Unsupported('tfhd');
+    if (!tfhd || tfhd.size < tfhd.hdr + 8) throw new Malformed('tfhd');
     let o = tfhd.start + tfhd.hdr;
     const tf = dv.getUint32(o) & 0xffffff;
     const tid = dv.getUint32(o + 4);
     const track = tracks[tid];
-    if (!track) throw new Unsupported('a fragment for an unknown track');
+    if (!track) throw new Malformed('a fragment for an unknown track');
     if (tf & 0x1) throw new Unsupported('absolute data offsets');
     if (!(tf & 0x20000)) throw new Unsupported('data offsets not relative to the fragment');
-    if (tfhd.size < tfhd.hdr + 8 + 4 * ((tf & 0x2 ? 1 : 0) + (tf & 0x8 ? 1 : 0) + (tf & 0x10 ? 1 : 0) + (tf & 0x20 ? 1 : 0))) throw new Unsupported('tfhd');
+    if (tfhd.size < tfhd.hdr + 8 + 4 * ((tf & 0x2 ? 1 : 0) + (tf & 0x8 ? 1 : 0) + (tf & 0x10 ? 1 : 0) + (tf & 0x20 ? 1 : 0))) throw new Malformed('tfhd');
     o += 8;
     const sdi = tf & 0x2 ? dv.getUint32(o) : track.trex.sdi; if (tf & 0x2) o += 4;
     const defDur = tf & 0x8 ? dv.getUint32(o) : track.trex.dur; if (tf & 0x8) o += 4;
     const defSize = tf & 0x10 ? dv.getUint32(o) : track.trex.size; if (tf & 0x10) o += 4;
     const defFlags = tf & 0x20 ? dv.getUint32(o) : track.trex.flags;
-    if (!tfdt) throw new Unsupported('no tfdt');
+    if (!tfdt) throw new Malformed('no tfdt');
     const vv = b[tfdt.start + tfdt.hdr];
-    if (tfdt.size < tfdt.hdr + (vv === 1 ? 12 : 8)) throw new Unsupported('tfdt');
+    if (tfdt.size < tfdt.hdr + (vv === 1 ? 12 : 8)) throw new Malformed('tfdt');
     let dts = vv === 1 ? Number(dv.getBigUint64(tfdt.start + tfdt.hdr + 4)) : dv.getUint32(tfdt.start + tfdt.hdr + 4);
     const samples = [];
     let dataAt = 0; // moof-relative; the first trun without an offset starts at the moof
     for (const trun of children(b, traf, 'trun')) {
       const end = trun.start + trun.size;
       let p = trun.start + trun.hdr;
-      if (p + 8 > end) throw new Unsupported('trun');
+      if (p + 8 > end) throw new Malformed('trun');
       const rf = dv.getUint32(p) & 0xffffff;
       const v1 = b[p] === 1;
       const n = dv.getUint32(p + 4);
@@ -154,7 +159,7 @@ function readMoof(b, moof, tracks, limit) {
       let first = null;
       if (rf & 0x4) { first = dv.getUint32(p); p += 4; }
       const per = (rf & 0x100 ? 4 : 0) + (rf & 0x200 ? 4 : 0) + (rf & 0x400 ? 4 : 0) + (rf & 0x800 ? 4 : 0);
-      if (p + n * per > end) throw new Unsupported('trun');
+      if (p + n * per > end) throw new Malformed('trun');
       for (let i = 0; i < n; i++) {
         const dur = rf & 0x100 ? dv.getUint32(p) : defDur; if (rf & 0x100) p += 4;
         const size = rf & 0x200 ? dv.getUint32(p) : defSize; if (rf & 0x200) p += 4;
@@ -162,7 +167,7 @@ function readMoof(b, moof, tracks, limit) {
         if (i === 0 && first !== null) flags = first;
         const cto = rf & 0x800 ? (v1 ? dv.getInt32(p) : dv.getUint32(p)) : 0; if (rf & 0x800) p += 4;
         if (cto !== 0) throw new Unsupported('reordered frames (composition offsets)');
-        if (dataAt < 0 || dataAt + size > limit) throw new Unsupported('sample data outside its fragment');
+        if (dataAt < 0 || dataAt + size > limit) throw new Malformed('sample data outside its fragment');
         samples.push({ dts, dur, size, flags, at: dataAt });
         dts += dur;
         dataAt += size;
@@ -177,7 +182,7 @@ function readMoof(b, moof, tracks, limit) {
 function windowed(read, size) {
   let base = 0, buf = new Uint8Array(0);
   return async (pos, len) => {
-    if (pos + len > size) throw new Unsupported('read past the end');
+    if (pos + len > size) throw new Malformed('read past the end');
     if (pos < base || pos + len > base + buf.length) {
       base = pos;
       buf = await read(pos, Math.min(size - pos, Math.max(len, READ_WINDOW)));
@@ -245,16 +250,18 @@ export async function startRedact(read, size) {
     pos += box.size;
   }
   if (!moov) throw new Unsupported('no moov at the start');
-  if (moov.size > MAX_MOOV || moov.start + moov.size > size) throw new Unsupported('moov');
+  if (moov.size > MAX_MOOV || moov.start + moov.size > size) throw new Malformed('moov');
   const mb = moov.start + moov.size > head.length ? await read(0, moov.start + moov.size) : head;
   const tracks = readMoov(mb, { ...moov, start: moov.start });
   const t = {};
   for (const [id, tr] of Object.entries(tracks)) t[id] = { ...tr, lastOut: -1, lastEnd: 0, chain: false, brk: false };
-  return { v: 1, pos: moov.start + moov.size, headEnd: moov.start + moov.size, tracks: t, started: false, extra: null, seq: 0, outPos: 0, segments: [], refs: [], maxEnd: 0, done: false };
+  return { v: 1, pos: moov.start + moov.size, headEnd: moov.start + moov.size, tracks: t, seen: false, started: false, extra: null, seq: 0, outPos: 0, segments: [], refs: [], maxEnd: 0, done: false };
 }
 
 // Works through fragments until the file ends or `budgetMs` passes, writing output segments with
-// `writeSegment(bytes) → { key, size }`. Mutates and returns `state`; state.done when finished.
+// `writeSegment(chunks, size) → { key, size }` (chunks: Uint8Arrays, in order). Mutates and
+// returns `state`; state.done when finished. A step that throws leaves `state` half-advanced:
+// pass in a copy, and keep the one from before the step if it throws.
 // `primary`: this is the main file (the one that sets the start trim, see the header).
 export async function redactStep(read, size, state, { cuts, offset = 0, primary = true, budgetMs = 20000, writeSegment }) {
   const t0 = Date.now();
@@ -268,10 +275,7 @@ export async function redactStep(read, size, state, { cuts, offset = 0, primary 
   let pending = [], pendingBytes = 0;
   const flush = async () => {
     if (!pendingBytes) return;
-    const buf = new Uint8Array(pendingBytes);
-    let o = 0;
-    for (const p of pending) { buf.set(p, o); o += p.length; }
-    state.segments.push(await writeSegment(buf));
+    state.segments.push(await writeSegment(pending, pendingBytes));
     pending = []; pendingBytes = 0;
   };
 
@@ -279,20 +283,30 @@ export async function redactStep(read, size, state, { cuts, offset = 0, primary 
     if (state.pos + 8 > size) { state.done = true; break; }
     const hb = await at(state.pos, Math.min(16, size - state.pos));
     const box = boxAt(hb, 0, hb.length);
-    if (!box) throw new Unsupported('not a box');
+    if (!box) throw new Malformed('not a box');
     if (box.size === 0) box.size = size - state.pos;
     if (state.pos + box.size > size || box.type === 'mfra') { state.done = true; break; } // a truncated tail, or the end
     if (box.type !== 'moof') { state.pos += box.size; continue; }
-    // The moof and the mdat after it, read together.
-    const mh = state.pos + box.size + 8 <= size ? await at(state.pos + box.size, 16) : null;
-    const mdat = mh && boxAt(mh, 0, mh.length);
-    if (!mdat || mdat.type !== 'mdat') throw new Unsupported('a moof without its mdat');
+    // The moof and the mdat after it, read together. A recording cut off after its last moof
+    // (the upload ended there) just ends.
+    const after = state.pos + box.size;
+    if (after + 8 > size) { state.done = true; break; }
+    const mh = await at(after, Math.min(16, size - after));
+    const mdat = boxAt(mh, 0, mh.length);
+    if (!mdat || mdat.type !== 'mdat') throw new Malformed('a moof without its mdat');
     if (mdat.size === 0) mdat.size = size - state.pos - box.size;
     const fragLen = box.size + mdat.size;
-    if (fragLen > MAX_FRAGMENT) throw new Unsupported('a fragment too large');
+    if (fragLen > MAX_FRAGMENT) throw new Malformed('a fragment too large');
     if (state.pos + fragLen > size) { state.done = true; break; }
     const frag = await at(state.pos, fragLen);
-    const trafs = readMoof(frag, { type: 'moof', start: 0, size: box.size, hdr: box.hdr }, tracks, fragLen);
+    let trafs;
+    try { trafs = readMoof(frag, { type: 'moof', start: 0, size: box.size, hdr: box.hdr }, tracks, fragLen); }
+    catch (e) {
+      // What kind of file this is shows in its first fragment. A later one that looks like
+      // another kind is damage, not a reason to hand out the stored file.
+      if (e instanceof Unsupported && state.seen) throw new Malformed(`${e.message}, after the first fragment`);
+      throw e;
+    }
 
     // Video first: whether it may start yet decides the sound at the start.
     trafs.sort((a, b) => (tracks[a.tid].kind === 'video' ? 0 : 1) - (tracks[b.tid].kind === 'video' ? 0 : 1));
@@ -353,6 +367,7 @@ export async function redactStep(read, size, state, { cuts, offset = 0, primary 
       outTrafs.push({ tid: tr.tid, sdi: tr.sdi, explicitSdi: tr.explicitSdi, out });
     }
     state.pos += fragLen;
+    state.seen = true;
     if (outTrafs.length) {
       outTrafs.sort((a, b) => a.tid - b.tid);
       const bytes = writeFragment(++state.seq, outTrafs, frag);
