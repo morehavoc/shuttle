@@ -14,6 +14,7 @@ const PORT = 8799;
 const BASE = process.env.BASE || `http://127.0.0.1:${PORT}`;
 const PASSWORD = 'test-password-123';
 let server;
+let serverLog = '';
 
 // Never let a local run pick up Cloudflare credentials from the environment.
 export function cleanEnv() {
@@ -30,14 +31,13 @@ async function startServer() {
   server = spawn('npx', ['wrangler', 'dev', '--env', 'local', '--port', String(PORT), '--ip', '127.0.0.1', '--persist-to', '.wrangler/test-state',
     '--var', `OWNER_PASSWORD:${PASSWORD}`, '--var', 'TRANSCRIBE_FAKE:1', '--var', 'HSTS:1', '--test-scheduled', '--show-interactive-dev-session=false'],
   { cwd: root, stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: cleanEnv() });
-  let log = '';
-  server.stdout.on('data', (d) => { log += d; });
-  server.stderr.on('data', (d) => { log += d; });
+  server.stdout.on('data', (d) => { serverLog += d; });
+  server.stderr.on('data', (d) => { serverLog += d; });
   for (let i = 0; i < 120; i++) {
     try { const r = await fetch(`${BASE}/api/me`); if (r.ok) return; } catch {}
     await new Promise((r) => setTimeout(r, 500));
   }
-  throw new Error('wrangler dev did not start:\n' + log);
+  throw new Error('wrangler dev did not start:\n' + serverLog);
 }
 function stopServer() { if (server) { try { process.kill(-server.pid, 'SIGTERM'); } catch {} } }
 
@@ -66,7 +66,7 @@ function wav(seconds) {
 const results = [];
 async function test(name, fn) {
   try { await fn(); results.push(['ok', name]); console.log('  ok  ', name); }
-  catch (e) { results.push(['FAIL', name]); console.log('  FAIL', name, '\n       ', e.message); }
+  catch (e) { results.push(['FAIL', name]); console.log('  FAIL', name, '\n       ', e.message, e.cause ? `(${e.cause.code || ''} ${e.cause.message || e.cause})` : ''); }
 }
 
 try {
@@ -1023,5 +1023,7 @@ try {
   stopServer();
 }
 const failed = results.filter((r) => r[0] === 'FAIL').length;
+// On a failure, what the server said (errors and the requests around them).
+if (failed && serverLog) console.log('\n--- server log (last 120 lines, warnings left out) ---\n' + serverLog.split('\n').filter((l) => !/WARNING|env\.local|"ai"|not what you|Please add|^\s*$/.test(l)).slice(-120).join('\n'));
 console.log(`\n${results.length - failed}/${results.length} passed`);
 process.exit(failed ? 1 : 0);
