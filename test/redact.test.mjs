@@ -244,15 +244,23 @@ await t('B-frames: refused (Unsupported), never half-done', async () => {
   await assert.rejects(redact(f, [[1, 2]]), Unsupported);
 });
 
-await t('not MP4 (WebM): refused', async () => {
+// (A WebM recording never gets here: the server marks it unsupported by its type. A file that
+// claims to be MP4 and isn't is damage.)
+await t('not MP4 inside (WebM bytes): Malformed, so viewers wait', async () => {
   const f = path.join(dir, 'x.webm');
   ff('-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30', '-t', '2', '-c:v', 'libvpx', f);
-  await assert.rejects(redact(f, [[0.5, 1]]), Unsupported);
+  await assert.rejects(redact(f, [[0.5, 1]]), Malformed);
 });
 
-await t('plain (not fragmented) MP4: refused', async () => {
+await t('plain MP4, header at the end (no recorder writes one): Malformed', async () => {
   const f = path.join(dir, 'flat.mp4');
   ff('-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30', '-t', '2', '-c:v', 'libx264', '-bf', '0', f);
+  await assert.rejects(redact(f, [[0.5, 1]]), Malformed);
+});
+
+await t('plain MP4, header first: Unsupported (a kind of file, not damage)', async () => {
+  const f = path.join(dir, 'flat-fast.mp4');
+  ff('-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30', '-t', '2', '-c:v', 'libx264', '-bf', '0', '-movflags', 'faststart', f);
   await assert.rejects(redact(f, [[0.5, 1]]), Unsupported);
 });
 

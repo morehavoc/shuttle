@@ -812,8 +812,13 @@ try {
     d1(`UPDATE videos SET redact = '${stale.replace(/'/g, "''")}' WHERE id = '${rid}'`);
     assert.equal((await call(`/raw/${rid}`, { anon: true })).status, 404);
     assert.equal((await call(`/raw/${rid}?r=${red.ver}`, { anon: true })).status, 404);
-    d1(`UPDATE videos SET redact = '${JSON.stringify(red).replace(/'/g, "''")}' WHERE id = '${rid}'`);
-    assert.equal((await call(`/raw/${rid}`, { anon: true, method: 'HEAD' })).status, 200);
+    assert.equal((await j(await call(`/api/videos/${rid}`))).shared, 'pending');
+    // …and it doesn't stay stuck: the next step replaces it with a build for the edits as they are.
+    const r = await j(await call(`/api/videos/${rid}/redact`, { method: 'POST', body: {} }));
+    assert.equal(r.shared, 'ready');
+    const now = JSON.parse(JSON.parse(d1(`SELECT redact FROM videos WHERE id = '${rid}'`))[0].results[0].redact);
+    assert.notEqual(now.ver, red.ver);
+    assert.equal((await call(`/raw/${rid}?r=${now.ver}`, { anon: true, method: 'HEAD' })).status, 200);
   });
 
   await test('edited video: deleting it deletes its copies', async () => {

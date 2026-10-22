@@ -23,7 +23,7 @@ import { boxAt, boxesIn, sidxBox } from './mp4index.js';
 
 export const SEG_BYTES = 8 * 1024 * 1024; // output segment size to aim for
 const READ_WINDOW = 4 * 1024 * 1024;
-const MAX_FRAGMENT = 24 * 1024 * 1024; // one moof + mdat; a recorder's are a few MB at most (a Worker has 128 MB)
+const MAX_FRAGMENT = 16 * 1024 * 1024; // one moof + mdat; a recorder's are a few MB at most (a Worker has 128 MB)
 const MAX_MOOV = 8 * 1024 * 1024;
 
 // A kind of file this can't redact (WebM, plain MP4, B-frames…): the owner is told, and viewers
@@ -240,7 +240,7 @@ const isSync = (flags) => !((flags >> 16) & 1);
 export async function startRedact(read, size) {
   const head = await read(0, Math.min(size, 256 * 1024));
   const first = boxAt(head, 0, head.length);
-  if (!first || first.type !== 'ftyp') throw new Unsupported('not an MP4');
+  if (!first || first.type !== 'ftyp') throw new Malformed('not an MP4 (the server only stores MP4 or WebM, by type)');
   let pos = 0, moov = null;
   while (pos + 8 <= head.length) {
     const box = boxAt(head, pos, head.length);
@@ -249,7 +249,7 @@ export async function startRedact(read, size) {
     if (box.type === 'moof' || box.type === 'mdat') break;
     pos += box.size;
   }
-  if (!moov) throw new Unsupported('no moov at the start');
+  if (!moov) throw new Malformed('no moov at the start'); // a recorder's is always there
   if (moov.size > MAX_MOOV || moov.start + moov.size > size) throw new Malformed('moov');
   const mb = moov.start + moov.size > head.length ? await read(0, moov.start + moov.size) : head;
   const tracks = readMoov(mb, { ...moov, start: moov.start });

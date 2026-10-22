@@ -60,7 +60,8 @@ export default {
   // delete copies nothing points at, then index a few files that have no fragment index yet.
   // Every 5 minutes: viewers' copies still to build (a cheap query when there are none).
   async scheduled(event, env, ctx) {
-    if (event.cron === '*/5 * * * *') { ctx.waitUntil(redactBacklog(env)); return; }
+    // (A cron this frequent gets 30 s of CPU: one short step's worth.)
+    if (event.cron === '*/5 * * * *') { ctx.waitUntil(redactBacklog(env, 20000)); return; }
     ctx.waitUntil(sweepExpired(env).then(() => redactBacklog(env)).then(() => sweepCopies(env)).then(() => indexBacklog(env)));
   },
 };
@@ -371,10 +372,10 @@ async function patchVideo(request, env, ctx, id, url) {
     const { sets, args, next } = editsFrom(body, v);
     let rebuild = null, where = '';
     if (body.cuts !== undefined || body.trim !== undefined) {
+      where = ' AND redact IS ?';
       const r = redactFor(next, parseJson(v.redact, null));
       if (r !== undefined) {
         sets.push('redact = ?'); args.push(r === null ? null : JSON.stringify(r));
-        where = ' AND redact IS ?';
         rebuild = { old: parseJson(v.redact, null), next: r };
       }
     }
@@ -1011,8 +1012,18 @@ async function runRedact(env, id, budgetMs) {
   if (!row) return null;
   let r = parseJson(row.redact, null);
   if (!r) return null;
+  if (r.sig !== editSig(row)) {
+    // A copy for other edits (a row written before the edits settled): never built on or served;
+    // replaced by a build for these.
+    const fresh = redactFor(row, null);
+    if (await swapRedact(env, id, row.redact, fresh === undefined ? null : fresh)) {
+      if (r.ver) await dropCopies(env, id, r.ver).catch(() => {});
+      if (fresh && fresh.state === 'pending') return runRedact(env, id, budgetMs - (Date.now() - t0));
+      return fresh ? fresh.state : null;
+    }
+    return 'pending';
+  }
   if (r.state !== 'pending') return r.state;
-  if (r.sig !== editSig(row)) return 'pending'; // can't happen (see above); never build for other edits
   if (r.since && Date.now() - r.since < REDACT_LEASE_MS && r.claim) return 'pending'; // someone is on it
   if (r.tries >= REDACT_TRIES) {
     await swapRedact(env, id, row.redact, { ...r, state: 'failed', claim: null, failedAt: Date.now() });
@@ -1149,11 +1160,14 @@ async function redactBacklog(env, budgetMs = 4 * 60e3) {
         if (cur.ver) await dropCopies(env, id, cur.ver).catch(() => {});
       }
       // Each video until done (or the budget runs out), a step at a time.
+      let before = null;
       for (let i = 0; i < 200 && Date.now() - t0 < budgetMs; i++) {
         if ((await runRedact(env, id, Math.min(stepMs(env), budgetMs - (Date.now() - t0)))) !== 'pending') break;
         const now = await env.DB.prepare('SELECT redact FROM videos WHERE id = ?').bind(id).first();
         const r = parseJson(now && now.redact, null);
         if (!r || r.state !== 'pending' || r.claim) break; // someone else has it, or it gave up for now
+        if (now.redact === before) break; // no progress: leave it for the next run
+        before = now.redact;
       }
     }
   } catch (e) { console.error('redact backlog', e && e.message); }
@@ -1161,26 +1175,35 @@ async function redactBacklog(env, budgetMs = 4 * 60e3) {
 
 // Copies no video points at any more (replaced by a newer edit, a build that lost a race, a
 // deleted video): deleted once they are an hour old, so a build still writing is never cut short.
-async function sweepCopies(env, maxKeys = 5000) {
-  try {
-    const live = new Map();
-    let cursor, seen = 0;
+// Walks video by video, then version by version (R2's delimited listing), so every one is reached
+// however many objects there are.
+async function sweepCopies(env, budgetMs = 2 * 60e3) {
+  const t0 = Date.now();
+  const prefixes = async (prefix) => {
+    const out = [];
+    let cursor;
     do {
-      const page = await env.VIDEOS.list({ prefix: 'redacted/', cursor });
-      const old = [];
-      for (const o of page.objects) {
-        const [, id, ver] = o.key.split('/');
-        if (!live.has(id)) {
-          const row = await env.DB.prepare('SELECT redact FROM videos WHERE id = ?').bind(id).first();
-          const r = row && parseJson(row.redact, null);
-          live.set(id, r && r.ver ? r.ver : null);
-        }
-        if (live.get(id) !== ver && o.uploaded && Date.now() - o.uploaded.getTime() > 60 * 60e3) old.push(o.key);
-      }
-      if (old.length) await env.VIDEOS.delete(old);
-      seen += page.objects.length;
+      const page = await env.VIDEOS.list({ prefix, delimiter: '/', cursor });
+      out.push(...page.delimitedPrefixes);
       cursor = page.truncated ? page.cursor : undefined;
-    } while (cursor && seen < maxKeys);
+    } while (cursor);
+    return out;
+  };
+  try {
+    for (const vp of await prefixes('redacted/')) {
+      if (Date.now() - t0 > budgetMs) return;
+      const id = vp.split('/')[1];
+      const row = await env.DB.prepare('SELECT redact FROM videos WHERE id = ?').bind(id).first();
+      const r = row && parseJson(row.redact, null);
+      const live = r && r.ver ? r.ver : null;
+      for (const verp of await prefixes(vp)) {
+        const ver = verp.split('/')[2];
+        if (ver === live) continue;
+        const page = await env.VIDEOS.list({ prefix: verp, limit: 1000 });
+        const newest = Math.max(0, ...page.objects.map((o) => (o.uploaded ? o.uploaded.getTime() : Date.now())));
+        if (Date.now() - newest > 60 * 60e3) await dropCopies(env, id, ver);
+      }
+    }
   } catch (e) { console.error('sweep copies', e && e.message); }
 }
 
