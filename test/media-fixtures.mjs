@@ -74,16 +74,41 @@ export function tones(file) {
 // (+1 µs: ffprobe prints times rounded to the microsecond, which can put a cut's end frame inside it.)
 export const srcOf = (file) => { const m = new Map(); for (const f of frames(file)) m.set(f.n, f.t + 1e-6); return m; };
 
-// A track's packets: [{ pts, dur }] in the stream's own time units.
-export function packets(file, stream = 'v') {
-  return execFileSync('ffprobe', ['-v', 'error', '-select_streams', stream, '-show_entries', 'packet=pts,duration', '-of', 'csv=p=0', file])
-    .toString().trim().split('\n').map((l) => { const [pts, dur] = l.split(',').map((x) => parseInt(x, 10)); return { pts, dur }; });
-}
-
-// Where one packet's time runs past or short of the next one's start (more than a tick).
-export function seams(file, stream = 'v') {
-  const p = packets(file, stream);
+// Where one video sample's time runs past or short of the next one's start, read straight from
+// a copy's own boxes (tfdt + trun), not through ffprobe, whose packet durations differ between
+// ffmpeg versions. Only for files this repo writes (explicit per-sample durations).
+export function seams(file) {
+  const b = fs.readFileSync(file);
+  const u32 = (o) => b.readUInt32BE(o);
+  const kids = (from, to) => { const out = []; for (let o = from; o + 8 <= to;) { const sz = u32(o); if (sz < 8) break; out.push({ o, sz, ty: b.toString('latin1', o + 4, o + 8) }); o += sz; } return out; };
+  const top = kids(0, b.length);
+  const moov = top.find((x) => x.ty === 'moov');
+  let video = null;
+  for (const trak of kids(moov.o + 8, moov.o + moov.sz).filter((x) => x.ty === 'trak')) {
+    const tk = kids(trak.o + 8, trak.o + trak.sz);
+    const tkhd = tk.find((x) => x.ty === 'tkhd'), mdia = tk.find((x) => x.ty === 'mdia');
+    const hdlr = kids(mdia.o + 8, mdia.o + mdia.sz).find((x) => x.ty === 'hdlr');
+    if (b.toString('latin1', hdlr.o + 16, hdlr.o + 20) === 'vide') video = u32(tkhd.o + 8 + (b[tkhd.o + 8] === 1 ? 20 : 12));
+  }
+  const runs = []; // [start, total duration] per traf of the video track
+  for (const moof of top.filter((x) => x.ty === 'moof')) {
+    for (const traf of kids(moof.o + 8, moof.o + moof.sz).filter((x) => x.ty === 'traf')) {
+      const k = kids(traf.o + 8, traf.o + traf.sz);
+      if (u32(k.find((x) => x.ty === 'tfhd').o + 12) !== video) continue;
+      const tfdt = k.find((x) => x.ty === 'tfdt');
+      const t = b[tfdt.o + 8] === 1 ? Number(b.readBigUInt64BE(tfdt.o + 12)) : u32(tfdt.o + 12);
+      let d = 0;
+      for (const trun of k.filter((x) => x.ty === 'trun')) {
+        const flags = u32(trun.o + 8) & 0xffffff, n = u32(trun.o + 12);
+        if (!(flags & 0x100)) throw new Error('seams() reads explicit sample durations only');
+        let p = trun.o + 16 + (flags & 1 ? 4 : 0) + (flags & 4 ? 4 : 0);
+        const per = [0x100, 0x200, 0x400, 0x800].filter((f) => flags & f).length * 4;
+        for (let i = 0; i < n; i++, p += per) d += u32(p);
+      }
+      runs.push([t, d]);
+    }
+  }
   const out = [];
-  for (let i = 1; i < p.length; i++) if (Math.abs(p[i - 1].pts + p[i - 1].dur - p[i].pts) > 1) out.push(i);
+  for (let i = 1; i < runs.length; i++) if (runs[i - 1][0] + runs[i - 1][1] !== runs[i][0]) out.push(i);
   return out;
 }
