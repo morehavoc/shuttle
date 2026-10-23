@@ -239,48 +239,72 @@ function renderPreview() {
   }
 }
 
+// Opens the camera or mic picked on the setup sheet by its exact id. Chrome and Brave treat a preferred id as a
+// hint and open the device chosen in the browser's own settings instead, so the picker did
+// nothing there. A picked device that's gone (unplugged, or its id reset with the site's data)
+// falls back to the default one, and the picker then shows what actually opened.
+async function openPicked(kind, id, constraints) {
+  const ask = (exact) => navigator.mediaDevices.getUserMedia({
+    video: false, audio: false,
+    [kind]: exact ? { ...constraints, deviceId: { exact } } : constraints,
+  });
+  if (!id) return ask('');
+  try { return await ask(id); }
+  catch (e) {
+    if (!e || (e.name !== 'OverconstrainedError' && e.name !== 'NotFoundError')) throw e;
+    return ask('');
+  }
+}
+
+function stopTracks(stream) { if (stream) stream.getTracks().forEach((t) => t.stop()); }
+
+// Picking again before the last pick has opened: only the newest counts, and the older stream
+// is stopped rather than left holding the camera (and its light).
+let camGen = 0, micGen = 0;
+
 async function acquireCamera() {
   if (!needsCamera()) return;
+  const gen = ++camGen;
   stopStream('cameraStream');
   setup.camMsg = '';
   if (setup.el) renderPreview();
   const id = store.get('cameraId', '');
-  const ask = () => navigator.mediaDevices.getUserMedia({
-    video: { deviceId: id ? { ideal: id } : undefined, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-    audio: false,
-  });
+  const ask = () => openPicked('video', id, { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } });
+  let stream = null, msg = '';
   try {
-    try { setup.cameraStream = await ask(); }
+    try { stream = await ask(); }
     catch (e) {
       // iPhone Safari can still be letting go of the last recording's camera: one more try.
       if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError' || e.name === 'NotFoundError')) throw e;
       await new Promise((r) => setTimeout(r, 1200));
-      if (!setup.el) return;
-      setup.cameraStream = await ask();
+      if (!setup.el || gen !== camGen) return;
+      stream = await ask();
     }
   } catch (e) {
-    setup.cameraStream = null;
-    setup.camMsg = cameraError(e);
+    msg = cameraError(e);
   }
-  if (setup.el) renderPreview();
-  else stopStream('cameraStream');
+  if (!setup.el || gen !== camGen) return stopTracks(stream);
+  setup.cameraStream = stream;
+  setup.camMsg = msg;
+  renderPreview();
+  fillDevices();
 }
 
 async function acquireMic() {
   if (!setup.micOn) return;
+  const gen = ++micGen;
   stopStream('micStream');
   const id = store.get('micId', '');
+  let stream = null;
   try {
-    setup.micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { deviceId: id ? { ideal: id } : undefined, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: false,
-    });
+    stream = await openPicked('audio', id, { echoCancellation: true, noiseSuppression: true, autoGainControl: true });
   } catch (e) {
-    setup.micStream = null;
-    if (setup.el) $('#setup-note', setup.el).textContent = 'No microphone access.';
+    if (setup.el && gen === micGen) $('#setup-note', setup.el).textContent = 'No microphone access.';
   }
-  if (!setup.el) return stopStream('micStream');
+  if (!setup.el || gen !== micGen || !setup.micOn) return stopTracks(stream);
+  setup.micStream = stream;
   startMeter();
+  fillDevices();
 }
 
 function startMeter() {
@@ -326,7 +350,7 @@ function cameraError(e) {
 }
 
 function stopStream(key) {
-  if (setup[key]) setup[key].getTracks().forEach((t) => t.stop());
+  stopTracks(setup[key]);
   setup[key] = null;
 }
 
