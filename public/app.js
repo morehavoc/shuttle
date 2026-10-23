@@ -239,10 +239,10 @@ function renderPreview() {
   }
 }
 
-// Opens the camera or mic picked on the setup sheet by its exact id. Chrome and Brave treat a preferred id as a
-// hint and open the device chosen in the browser's own settings instead, so the picker did
-// nothing there. A picked device that's gone (unplugged, or its id reset with the site's data)
-// falls back to the default one, and the picker then shows what actually opened.
+// Opens the camera or mic picked on the setup sheet by its exact id. Chrome and Brave treat a
+// preferred id as a hint and open the device chosen in the browser's own settings instead, so
+// the picker did nothing there. A picked device that's gone (unplugged, or its id reset with
+// the site's data) falls back to the default one, and the picker then shows what opened.
 async function openPicked(kind, id, constraints) {
   const ask = (exact) => navigator.mediaDevices.getUserMedia({
     video: false, audio: false,
