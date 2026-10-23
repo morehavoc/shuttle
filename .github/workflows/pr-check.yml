@@ -1,5 +1,6 @@
-# Runs the deploy workflow's tests on every pull request, so a PR shows pass/fail BEFORE it is merged
-# (merging to main deploys). No secrets: pull_request from a fork gets none, and this job asks for none.
+# Runs the tests on every pull request, so a PR shows pass/fail BEFORE it is merged. Merging to main
+# deploys, and the deploy doesn't run the tests again. No secrets: pull_request from a fork gets
+# none, and this job asks for none.
 name: PR check
 
 on:
@@ -27,8 +28,10 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Generate the test fixture
+        # The script bounds and retries the ffmpeg install itself; this is the backstop.
+        timeout-minutes: 15
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
+          sh scripts/ci-ffmpeg.sh
           mkdir -p test/out
           ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 -t 20 \
             -c:v libx264 -b:v 3M -pix_fmt yuv420p -c:a aac -movflags frag_keyframe+empty_moov test/out/sample.mp4
