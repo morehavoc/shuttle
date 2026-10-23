@@ -58,7 +58,7 @@ ${v.hasThumb || v.hasOg ? `<meta property="og:image" content="${esc(ogImage)}">
     <p id="description" class="description"${v.description ? '' : ' hidden'}>${esc(v.description)}</p>
   </section>
   <div class="player-host" id="player-host">
-    ${ready ? '' : `<div class="player-pending" id="pending"><div class="spinner"></div><p>Finishing upload…</p></div>`}
+    ${ready ? '' : `<div class="player-pending" id="pending">${v.status === 'unavailable' ? '' : '<div class="spinner"></div>'}<p>${v.status === 'updating' ? 'Updating this video…' : v.status === 'unavailable' ? 'This video isn’t available right now.' : 'Finishing upload…'}</p></div>`}
   </div>
   <section class="share-actions" id="actions"></section>
   <section class="owner-panel" id="owner-panel" hidden></section>
@@ -83,6 +83,7 @@ export function renderEmbedPage(v, { origin, ownerName }) {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(v.title)}${ownerName ? ` · ${esc(ownerName)}` : ''}</title>
 <meta name="robots" content="noindex">
+${v.status === 'updating' ? '<meta http-equiv="refresh" content="15">' : ''}
 <link rel="canonical" href="${esc(`${origin}/v/${v.id}`)}">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.bunny.net"><link rel="stylesheet" href="https://fonts.bunny.net/css?family=fira-sans:500,600,700|noto-sans:400,700|jetbrains-mono:400,500&display=swap">
@@ -90,7 +91,7 @@ export function renderEmbedPage(v, { origin, ownerName }) {
 </head>
 <body class="embed">
 <div class="player-host" id="player-host">
-  ${ready ? '' : `<div class="player-pending"><p>This video is still uploading.</p></div>`}
+  ${ready ? '' : `<div class="player-pending"><p>${v.status === 'updating' ? 'This video is being updated. It will be back in a moment.' : v.status === 'unavailable' ? 'This video isn’t available right now.' : 'This video is still uploading.'}</p></div>`}
 </div>
 <script type="application/json" id="shuttle-data">${data}</script>
 ${ready ? '<script src="/embed.js" type="module"></script>' : ''}

@@ -30,7 +30,7 @@ Screenshots come from a real recording on a local server, made by `scripts/readm
 - **Fast start.** Browsers record MP4 as a chain of one-second fragments with no table of contents, so Chrome walks the whole chain before it plays or seeks. After Stop the server writes a fragment index (`sidx`, about 2 KB for 3 minutes) and splices it in front of the fragments as the file is served; the stored file never changes. "Complete" waits for it (up to 15 s), so the share page you land on starts at once, and each page keeps asking for the file the way it first got it (`?ix=0/1`), so an index that lands later never moves bytes under a playing video.
 - **Transcript** while you record: the audio is cut into half-minute chunks at quiet moments and transcribed as it goes. Chunk positions are measured against the recording, and word edges next to pauses are snapped to the audio.
 - **Description:** once the transcript is done, a title (only if you haven't renamed it) and a one- or two-sentence description are drafted for you; edit either in place, or **Write one for me** again. Your own text is never overwritten.
-- **Expiry:** each video keeps 7, 30 or 90 days, or forever (new recordings use your last choice; 30 days to start). Expired videos disappear at once and are deleted by an hourly cron (`[triggers]` in `wrangler.toml`).
+- **Expiry:** each video keeps 7, 30 or 90 days, or forever (new recordings use your last choice; 30 days to start). Expired videos disappear at once and are deleted by an hourly cron (`[triggers]` in `wrangler.toml`; a second one, every 5 minutes, finishes viewers' copies of edited videos).
 - **Editing from the transcript** (owner): select words and cut them, **Remove ums**, **Shorten pauses** (pauses of 1–8 s; a longer silence is usually you showing something), undo, restore all. Captions come from the same words.
 - **Trim** (owner): two handles set where the video starts and stops; the player shows the frame under the handle while you drag. The trim is stored apart from the cuts (neither swallows the other), and its end means "from here on" whatever length a browser reads the file to be. The transcript (trimmed words are dimmed), Undo in its Edit mode, viewers and the edited download follow it; **Reset** takes it off and leaves the cuts. **Shorten pauses** stops at the trim, so taking the trim off brings back everything it hid.
 - **Share page** at `/v/<id>`. It has:
@@ -50,7 +50,7 @@ Screenshots come from a real recording on a local server, made by `scripts/readm
 
 Links are public by unguessable id (12 characters, about 70 bits). Everything else needs the owner password.
 
-**What "cut" and "trim" mean:** edits are skipped during playback. They are not removed from the file. The full recording stays reachable at `/raw/<id>` (it has to be public to stream), and the cut and trim ranges are in the page. Don't rely on either to hide something sensitive; re-record instead. A start trim takes the poster and the link-preview picture again from the new start, but a preview already shown in a chat keeps the old picture.
+**What "cut" and "trim" mean:** you (the owner) keep the whole recording; your player skips the edits, and Undo can bring anything back. Viewers get a separate copy with the edited-out parts taken out of the file, so a share link (or `/raw/<id>`) never hands out what you cut. The server builds the copy in the background a few seconds after an edit (no re-encoding: it copies what it keeps). Until it is ready, viewers see "Updating this video…", never the original; the owner's page shows its state under **Shared**. Sound is cut to about 20 ms. Video can only restart on a key frame, so after a cut the picture holds still for up to a second while the sound plays, and a trimmed start moves on to the next key frame (up to a second more is trimmed). The recorder asks for a key frame every second; recordings made before that may have them several seconds apart in Chrome, which makes those holds longer. A recording the server can't cut this way (WebM from Firefox, say) is marked so on the owner's page, and its viewers get the whole file with the edits skipped, as before. A start trim takes the poster and the link-preview picture again from the new start, but a preview already shown in a chat keeps the old picture. The description drafted from the transcript is written before any edits; reread it if you cut something it might mention.
 
 ## Deploy
 
@@ -88,9 +88,11 @@ npm run dev                                       # migrations + wrangler dev --
   - the timeline maths (19 checks);
   - the transcript post-processing (17);
   - the fragment index on hostile files (12);
-  - the API contract (50), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
+  - the viewers' copy of an edited video (25): every frame and every bit of sound in the test recordings says when it was recorded, so decoding a copy shows that nothing from inside a cut is in it, that it stays in sync, and how damaged or cut-off files are handled;
+  - the API contract (63), against `wrangler dev --env local` with local R2 and D1. This needs `test/out/sample.mp4`; see the workflow for the ffmpeg line.
 - `node test/e2e-mobile.mjs` is the phone run (WebKit, iPhone 15 emulation). An iOS 27 iPhone can record the screen: it records Screen + cam, Screen and Camera with the labelled phone recording bar (one row from 320 to 430 px wide), records again without a refresh (after deleting one, via Library, after Safari's back/forward cache brings the page back), never reloads under a recording that is starting or under way, and saves a recording whose recorder fails while paused. An older iPhone without screen capture gets a camera-only setup that says why, and a laptop keeps the compact bar. Same `BASE`/server as below.
 - `node test/e2e-first-view.mjs` is the first view right after a recording (WebKit and Chromium): a 3-minute recorder-style file plays and seeks while the server's fast-start index lands. `INDEX_DELAY_MS=6000 INDEX_WAIT_MS=1000 sh test/serve.sh` + `EXPECT=late` lands it after the page opened (the page keeps `?ix=0`); a plain `sh test/serve.sh` + `EXPECT=early` checks "complete" waited for it (`?ix=1`).
+- `node test/e2e-edited.mjs` is an edited video as a viewer sees it (WebKit and Chromium): the share page and the embed play the copy, and the frames the browser actually shows are read back and checked against the cuts (screen and camera); seeks; the owner's page; a viewer who arrives while the copy is being built; and recordings made by each browser's own MediaRecorder. `node test/e2e-long-edit.mjs` builds a 10-minute 1080p copy in many short steps (`REDACT_STEP_MS=150 REDACT_FAIL_PUT=4 sh test/serve.sh` also fails a storage write mid-way) and checks it is byte for byte one clean build. Same `BASE`/server as below.
 - `node test/e2e-embed.mjs` is the embed run (WebKit and Chromium): a video plays inside another site's `<iframe>` of `/e/:id`, counts a view, the share page refuses to be framed, and the owner's Copy embed code copies the oEmbed iframe. Same `BASE`/server as below.
 - `node test/e2e.mjs` is the browser run: sign in, record, pause, stop, play the composite, layouts, transcript editing, trimming, captions, and what a viewer can reach. Start a server with `sh test/serve.sh` (fake transcriber) or `TRANSCRIBE=real sh test/serve.sh`, then set `BASE`. Options:
   - `ENGINE=chromium|webkit`, `MODE=screen-camera|screen|camera`
@@ -99,6 +101,7 @@ npm run dev                                       # migrations + wrangler dev --
   - `FAKE=1`: synthetic streams with a burnt-in time code, so camera/screen sync is checked frame by frame. WebKit always uses them, because Playwright can't grant camera permission on macOS.
   - `OFFSET_MS=700` (camera recorder starts late), `CAM_END=1` (camera dies mid-recording)
   - `SPEECH=1` (with a real transcriber): the fake mic speaks sentences. The run checks that transcript chunks sit where their audio is in the video, and that words line up with when they were said.
+- `test/media-fixtures.mjs` makes the self-describing test recordings (needs ffmpeg).
 - The fragment-index tests (`test/mp4index.test.mjs`) cover oversized counts, boxes and fragments, short fields, truncation, 3,000 random mutations, and that a long recording takes a few reads rather than one per fragment.
 
 ## Layout
@@ -108,6 +111,7 @@ src/worker.js        API, auth, range-served video, thumbnails, transcript chunk
 src/transcribe.js    Whisper providers, picking the trustworthy result, snapping words to the audio
 src/share-page.js    server-rendered share page (Open Graph tags)
 src/mp4index.js      fragment index (sidx) spliced into served MP4s so Chrome starts them at once
+src/redact.js        viewers' copy of an edited video: the MP4 with the edited-out samples removed
 public/app.js        library, setup sheet, recording flow
 public/recorder.js   capture, MediaRecorder ×2, part uploader, transcript tap, thumbnails
 public/pcm-tap.js    AudioWorklet: 16 kHz PCM for the transcript

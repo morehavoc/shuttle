@@ -698,15 +698,41 @@ try {
   }
 
   // ---------- what a viewer sees ----------
+  // The video has edits, so viewers get the server's copy with them taken out of the file; the
+  // owner's page shows when it's ready.
+  const edits = await videoNow();
+  if ((edits.cuts || []).length || edits.trim) {
+    await page.waitForFunction(() => /Viewers get a copy/.test((document.querySelector('.shared-note') || {}).textContent || ''), null, { timeout: 60000 }).catch(() => {});
+    const shared = (await videoNow()).shared;
+    check(shared === 'ready', 'the owner\'s page shows viewers get a copy with the edits removed', `shared: ${shared}`);
+  }
+  // A key frame about every second in what this browser recorded (where the copy can be cut).
+  for (const t of meta.hasCam ? ['', '/cam'] : ['']) {
+    const f = path.join(out, `stored${t.replace('/', '-')}.mp4`);
+    (await import('node:fs')).writeFileSync(f, await (await page.request.get(`${BASE}/raw/${meta.id}${t}?ix=0`)).body());
+    const keys = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v', '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', f]).toString().trim().split('\n')
+      .filter((l) => l.includes('K')).map((l) => parseFloat(l));
+    const gaps = keys.slice(1).map((k, i) => k - keys[i]);
+    const worst = Math.max(...gaps);
+    check(keys.length > 2 && worst < 1.6, `${t ? 'camera' : 'screen'} file: a key frame every ~1 s (${keys.length} of them, widest gap ${worst.toFixed(2)} s)`, `${t || 'main'} key frames: ${keys.map((k) => k.toFixed(2)).join(' ')}`);
+  }
   const vctx = await newContext();
   const vpage = await vctx.newPage();
   await vpage.goto(shareUrl);
   await vpage.waitForSelector('.sp');
+  const vSrc = await vpage.evaluate(() => document.querySelector('.sp-main').getAttribute('src'));
+  check(/\?r=\w+$/.test(vSrc), `viewer plays the edited copy (${vSrc})`, `viewer src ${vSrc}`);
   const vSpeed = await vpage.evaluate(() => document.querySelector('.sp-main, .sp video').playbackRate);
   check(vSpeed === 1.2, 'viewer\'s player starts at the owner\'s speed', `viewer starts at ${vSpeed}`);
   await vpage.click('.sp-big'); // the controls appear once it's playing
   const vStart = await vpage.evaluate(() => document.querySelector('.sp-main').currentTime);
-  check(vStart >= trimStart - 0.05 && vStart < trimStart + 1, `viewer's video starts at the trimmed start (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}, trim ${trimStart}`);
+  // The copy begins where the trim does (moved on to the next key frame), so it plays from its start.
+  check(vStart < 0.5, `viewer's video starts at the start of the copy (${vStart.toFixed(2)} s)`, `viewer started at ${vStart}`);
+  const vLen = await vpage.evaluate(() => document.querySelector('.sp-main').duration);
+  const { editedDuration: edLen, withTrim: wt } = await import('../public/timeline.js');
+  const full = await page.evaluate(() => document.querySelector('.sp-main').duration);
+  const wantLen = edLen(wt(edits.cuts, edits.trim, full), full);
+  check(Math.abs(vLen - wantLen) < 1.3, `the copy is the edited length (${vLen.toFixed(1)} s, edits give ${wantLen.toFixed(1)} s)`, `copy ${vLen} s vs ${wantLen} s`);
   await vpage.waitForTimeout(600);
   await vpage.hover('.sp');
   await vpage.click('.sp-speed');
@@ -736,7 +762,8 @@ try {
     words: document.querySelectorAll('.tc-body .w').length,
   }));
   check(!viewer.download && !viewer.panel && !viewer.editable, 'viewer gets no download, layout or rename controls', `viewer controls: ${JSON.stringify(viewer)}`);
-  if (!SPEECH) check(viewer.cut === 0 && viewer.words === ownerKept && viewer.words < nWords, `viewer transcript has only the words that play (${viewer.words} of ${nWords})`, `viewer words: ${JSON.stringify(viewer)}, owner's kept words ${ownerKept}`);
+  // The owner's kept words, less any the copy's start lost by moving on to a key frame (<1 s).
+  if (!SPEECH) check(viewer.cut === 0 && viewer.words <= ownerKept && viewer.words >= ownerKept - 3 && viewer.words < nWords, `viewer transcript has only the words that play (${viewer.words} of ${nWords}; owner keeps ${ownerKept})`, `viewer words: ${JSON.stringify(viewer)}, owner's kept words ${ownerKept}`);
   const dl = await vpage.evaluate(({ id, cam }) => Promise.all([`/raw/${id}?download=1`, `/raw/${id}?DOWNLOAD`, cam ? `/raw/${id}/cam?Download=1` : null].filter(Boolean).map((u) => fetch(u).then((r) => r.status))), { id: meta.id, cam: meta.hasCam });
   check(dl.every((s) => s === 403), 'viewer download URLs refused (any spelling)', `viewer download statuses ${dl}`);
   if (meta.hasCam) {

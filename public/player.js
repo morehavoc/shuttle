@@ -28,10 +28,11 @@ const pref = {
 
 // A recording's file, asked for the way this page first saw it: a page that opened before the
 // server added the fast-start index keeps getting the file without it, so its bytes never move
-// under a playing video (see the server's rawVideo).
+// under a playing video (see the server's rawVideo). A viewer of an edited video gets the edited
+// copy, named by version (`r`), so a newer edit never swaps the bytes under an open page either.
 export function rawUrl(v, track = 'main') {
-  const ix = v.ix ? `?ix=${v.ix[track] ? 1 : 0}` : '';
-  return `/raw/${v.id}${track === 'cam' ? '/cam' : ''}${ix}`;
+  const q = v.copy ? `?r=${encodeURIComponent(v.copy)}` : v.ix ? `?ix=${v.ix[track] ? 1 : 0}` : '';
+  return `/raw/${v.id}${track === 'cam' ? '/cam' : ''}${q}`;
 }
 
 export class Player extends EventTarget {
