@@ -1,5 +1,6 @@
 # Deploys Shuttle to Cloudflare (Worker + R2 bucket + D1 database). This is the only deploy path;
-# nobody runs `wrangler deploy` by hand.
+# nobody runs `wrangler deploy` by hand. It doesn't run the tests: pr-check.yml runs them on every
+# pull request, before it's merged, and every change reaches main through one.
 #
 # Repo secrets (Settings → Secrets and variables → Actions):
 #   CLOUDFLARE_API_TOKEN   account token with: Workers Scripts Edit, Workers R2 Storage Edit, D1 Edit
@@ -43,17 +44,6 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Generate the test fixture
-        # The script bounds and retries the ffmpeg install itself; this is the backstop.
-        timeout-minutes: 15
-        run: |
-          sh scripts/ci-ffmpeg.sh
-          mkdir -p test/out
-          ffmpeg -loglevel error -y -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 -t 20 \
-            -c:v libx264 -b:v 3M -pix_fmt yuv420p -c:a aac -movflags frag_keyframe+empty_moov test/out/sample.mp4
-      - name: API tests (wrangler dev, local R2 + D1)
-        run: npm test
-
       - name: Secrets present
         id: check
         env:

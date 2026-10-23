@@ -1,5 +1,6 @@
-# Runs the deploy workflow's tests on every pull request, so a PR shows pass/fail BEFORE it is merged
-# (merging to main deploys). No secrets: pull_request from a fork gets none, and this job asks for none.
+# Runs the tests on every pull request, so a PR shows pass/fail BEFORE it is merged. Merging to main
+# deploys, and the deploy doesn't run the tests again. No secrets: pull_request from a fork gets
+# none, and this job asks for none.
 name: PR check
 
 on:

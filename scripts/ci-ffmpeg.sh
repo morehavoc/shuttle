@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs ffmpeg on a GitHub Actions Ubuntu runner for the tests (both workflows run this).
+# Installs ffmpeg on a GitHub Actions Ubuntu runner for the tests (.github/workflows/pr-check.yml).
 #
 # On 2026-10-23 this install hung three times in an hour, 15 to 18 minutes each with no output at
 # all, where it normally takes 25 s to 2 min. All three were runners in Azure's westus3 region;
