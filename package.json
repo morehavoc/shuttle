@@ -13,6 +13,6 @@
     "test:e2e": "node test/e2e.mjs"
   },
   "devDependencies": {
-    "wrangler": "^4.148.0"
+    "wrangler": "^4.157.0"
   }
 }
